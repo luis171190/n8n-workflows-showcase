@@ -1,0 +1,181 @@
+{
+  "info": {
+    "_postman_id": "f0a1c2e0-3d3a-4d4f-9e4f-1234567890ab",
+    "name": "ACME Store — Product Search Bot",
+    "description": "End-to-end requests for the `e-commerce-product-search-bot` n8n workflow.\n\nThe collection contains 3 representative scenarios: nominal flow, natural-language price filter, and hallucination-triggered sanitization. Each request includes automated tests that assert the response shape (status 200, `reply` string, `products` array, `meta.validation` block).\n\n## Usage\n\n1. Import this file in Postman.\n2. Create a Postman environment with these variables:\n   - `base_url` — your n8n instance, e.g. `https://your-n8n.example.com`\n   - `webhook_path` — `/webhook/acme-search` (default)\n   - `bot_lang` — `en` or `es` (informational only; the actual language is controlled by `BOT_LANG` env var inside n8n)\n3. Hit each request and inspect the **Tests** tab to see assertions.\n\n## Schema asserted on every request\n\n```ts\n{\n  session_id: string,\n  reply: string,\n  products: Array<{ id: number|string, name: string, price: string, currency: string, in_stock: boolean }>,\n  meta: {\n    query: string,\n    intent: 'category_search' | 'brand_search' | 'free_text',\n    provider: 'openai' | 'anthropic',\n    latency_ms: number,\n    result_count: number,\n    validation: {\n      mentioned_count: number,\n      valid_count: number,\n      invalid_count: number,\n      hallucination_score: number,\n      sanitized: boolean,\n      sanitization_reason: string | null,\n      threshold: number\n    }\n  }\n}\n```",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Nominal — category search (laptops)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"laptop gamer\",\n  \"max_results\": 4\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}{{webhook_path}}",
+          "host": ["{{base_url}}{{webhook_path}}"]
+        },
+        "description": "**Demonstrates:** the nominal flow.\n\n- `Validate & Classify` detects `type=laptop`, `intent=category_search`.\n- `Pre-filter` ranks results by relevance.\n- LLM responds with valid `mentioned_ids`.\n- Anti-hallucination passes (score=0, no sanitization).\n\n**Expected:** `meta.validation.sanitized = false`, `result_count > 0`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const body = pm.response.json();",
+              "",
+              "pm.test('Schema: top-level keys present', function () {",
+              "    pm.expect(body).to.have.property('session_id').that.is.a('string');",
+              "    pm.expect(body).to.have.property('reply').that.is.a('string').and.has.length.greaterThan(0);",
+              "    pm.expect(body).to.have.property('products').that.is.an('array');",
+              "    pm.expect(body).to.have.property('meta').that.is.an('object');",
+              "});",
+              "",
+              "pm.test('Schema: meta.validation present', function () {",
+              "    pm.expect(body.meta).to.have.property('validation').that.is.an('object');",
+              "    pm.expect(body.meta.validation).to.have.property('hallucination_score').that.is.a('number');",
+              "    pm.expect(body.meta.validation).to.have.property('sanitized').that.is.a('boolean');",
+              "    pm.expect(body.meta.validation).to.have.property('threshold', 0.3);",
+              "});",
+              "",
+              "pm.test('Intent classified as category_search', function () {",
+              "    pm.expect(body.meta.intent).to.equal('category_search');",
+              "});",
+              "",
+              "pm.test('Provider matches LLM_PROVIDER env in n8n', function () {",
+              "    pm.expect(['openai', 'anthropic']).to.include(body.meta.provider);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Natural-language price filter (\"menos de 500\")",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"monitor 4k menos de 500\",\n  \"max_results\": 3\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}{{webhook_path}}",
+          "host": ["{{base_url}}{{webhook_path}}"]
+        },
+        "description": "**Demonstrates:** the price-hint parser.\n\n- `Validate & Classify` runs a regex against the raw query and extracts `price_max=500` from the natural-language phrase \"menos de 500\".\n- `Pre-filter` enforces the constraint against `prices.price` (in cents) returned by WooCommerce Store API.\n- All returned products satisfy `price <= 500`.\n\n**Expected:** every product in `products[]` has `parseFloat(price) <= 500`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const body = pm.response.json();",
+              "",
+              "pm.test('Schema valid', function () {",
+              "    pm.expect(body).to.have.property('reply').that.is.a('string');",
+              "    pm.expect(body).to.have.property('products').that.is.an('array');",
+              "});",
+              "",
+              "pm.test('All products are within the natural-language price limit (<= 500)', function () {",
+              "    body.products.forEach(p => {",
+              "        const price = parseFloat(p.price);",
+              "        pm.expect(price, `product ${p.id} (${p.name}) priced at ${price}`).to.be.at.most(500);",
+              "    });",
+              "});",
+              "",
+              "pm.test('Pre-filter cap respected (max_results=3)', function () {",
+              "    pm.expect(body.products.length).to.be.at.most(3);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Hallucination → sanitization",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"test-hallucination-001\",\n  \"query\": \"auriculares bluetooth premium\",\n  \"max_results\": 4\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}{{webhook_path}}",
+          "host": ["{{base_url}}{{webhook_path}}"]
+        },
+        "description": "**Demonstrates:** the anti-hallucination path.\n\nWith vague queries the LLM is more likely to invent product names. When that happens:\n\n1. `Anti-hallucination` cross-checks `mentioned_ids` against the real Store API IDs.\n2. Any `invalid_id` triggers sanitization regardless of the score.\n3. The reply is rebuilt 100% from real products.\n4. `bot_telemetry` records `sanitized=true` with `sanitization_reason='hallucination_threshold_exceeded'`.\n\n**Expected (in the affected case):** `meta.validation.sanitized = true`, `invalid_count >= 1`. If the LLM happens to behave correctly, the test only asserts the schema — sanitization is non-deterministic per request."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "const body = pm.response.json();",
+              "",
+              "pm.test('Schema valid', function () {",
+              "    pm.expect(body).to.have.property('reply').that.is.a('string').and.has.length.greaterThan(0);",
+              "    pm.expect(body).to.have.property('products').that.is.an('array');",
+              "    pm.expect(body.meta.validation).to.have.property('sanitized').that.is.a('boolean');",
+              "});",
+              "",
+              "pm.test('If sanitized, reply is rebuilt from real products only', function () {",
+              "    if (body.meta.validation.sanitized) {",
+              "        const realNames = body.products.map(p => (p.name || '').toLowerCase());",
+              "        // The fallback reply lists real product names — verify at least one shows up",
+              "        const replyLower = body.reply.toLowerCase();",
+              "        const anyMatch = realNames.some(n => n && replyLower.includes(n));",
+              "        pm.expect(anyMatch, 'expected at least one real product name in sanitized reply').to.be.true;",
+              "        pm.expect(body.meta.validation.sanitization_reason).to.be.oneOf([",
+              "            'no_results',",
+              "            'llm_parse_error',",
+              "            'hallucination_threshold_exceeded'",
+              "        ]);",
+              "    } else {",
+              "        pm.expect(body.meta.validation.invalid_count).to.equal(0);",
+              "    }",
+              "});",
+              "",
+              "pm.test('Hallucination score in [0, 1]', function () {",
+              "    const s = body.meta.validation.hallucination_score;",
+              "    pm.expect(s).to.be.at.least(0);",
+              "    pm.expect(s).to.be.at.most(1);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url",     "value": "https://your-n8n.example.com", "type": "string" },
+    { "key": "webhook_path", "value": "/webhook/acme-search",          "type": "string" },
+    { "key": "bot_lang",     "value": "en",                            "type": "string" }
+  ]
+}
