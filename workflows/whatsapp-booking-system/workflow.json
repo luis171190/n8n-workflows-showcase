@@ -1,0 +1,480 @@
+{
+  "name": "ACME Studio — WhatsApp Booking System",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 💬 ACME Studio — WhatsApp Booking System\n\nFlow: Evolution API webhook → Idempotency check → Session load → LLM (state-aware) → Action router (book / other) → Two-phase booking (PG + Google Calendar) → WhatsApp reply.\n\n**Demo store:** ACME Studio (barbería ficticia con 4 servicios).\n\nEnv vars:\n- `EVOLUTION_API_URL` / `EVOLUTION_API_KEY` / `EVOLUTION_INSTANCE`\n- `LLM_PROVIDER` (openai | anthropic) + corresponding API keys\n- `BOT_LANG` (en | es)\n- `BUSINESS_TIMEZONE` (e.g. America/Argentina/Buenos_Aires)\n- `BUSINESS_ID` (UUID)\n- `GOOGLE_CALENDAR_ID` (e.g. primary)\n- Postgres credential `booking_db` configured in n8n.\n- Google OAuth2 credential `google_calendar_oauth`.",
+        "height": 360,
+        "width": 480,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, -200],
+      "typeVersion": 1,
+      "id": "sticky-overview",
+      "name": "Overview"
+    },
+    {
+      "parameters": {
+        "content": "## 🔑 Idempotency\n\nEvolution API can re-deliver the same webhook (timeouts, retries). Without protection, the same message books twice.\n\n**Pattern used:**\n```sql\nINSERT INTO message_idempotency (message_id)\nVALUES ($1)\nON CONFLICT (message_id) DO NOTHING\nRETURNING message_id;\n```\n\nIf the INSERT returns 0 rows, the message was already processed → return 200 silently. No double bookings, no double replies.\n\nTTL: 24h. A daily cron clears old keys.",
+        "height": 320,
+        "width": 360,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-280, 380],
+      "typeVersion": 1,
+      "id": "sticky-idempotency",
+      "name": "Note: Idempotency"
+    },
+    {
+      "parameters": {
+        "content": "## 🔁 Conversational state\n\nState persists in Postgres (`booking_sessions`), keyed by `business_id:phone`. The LLM receives the current `state` + `context` JSONB + last message, and returns a JSON with:\n\n```\n{ intent, next_action, extracted, user_message }\n```\n\n`next_action` is whitelist-validated before routing. The session is UPSERTED at the end with the new state and partial context (e.g. service chosen but date pending). Expires after 30 min of inactivity.\n\nWhy not in-memory: n8n executions are stateless. Postgres survives restarts and lets you analyze conversations later.",
+        "height": 360,
+        "width": 380,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [340, 380],
+      "typeVersion": 1,
+      "id": "sticky-state",
+      "name": "Note: Conversational State"
+    },
+    {
+      "parameters": {
+        "content": "## 🏁 Race conditions: two-phase commit lite\n\nIf two users pick the same slot at the same moment, only one should win.\n\n**Pattern used:**\n1. `INSERT INTO bookings (..., status='PENDING') ON CONFLICT (service_id, start_at) DO NOTHING RETURNING id;`\n   — UNIQUE constraint = optimistic lock. Whoever's INSERT returns a row wins.\n2. POST Google Calendar event.\n3. UPDATE bookings SET status='CONFIRMED', google_event_id=...\n\nIf step 2 fails, the PENDING row is reaped by a sweeper (cron deletes PENDING > 60s). If two users race, one gets the row and the other gets `slot_taken=true` → reply 'sorry, just got booked, pick another'.\n\nNo distributed locks needed. Atomic at the DB level.",
+        "height": 380,
+        "width": 420,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [1340, 380],
+      "typeVersion": 1,
+      "id": "sticky-race",
+      "name": "Note: Race Conditions"
+    },
+    {
+      "parameters": {
+        "content": "## 🌎 Timezone handling\n\n- **Storage:** every TIMESTAMPTZ is UTC. No exceptions.\n- **Display:** when composing the reply, convert to `$env.BUSINESS_TIMEZONE` via `Intl.DateTimeFormat`.\n- **Google Calendar:** the API accepts ISO-8601 with offset. We send UTC + `timeZone` field (calendar default).\n- **LLM date parser:** the LLM receives `today` in business TZ as part of the context, so 'mañana a las 10' resolves correctly. The Code node validates with `Date.parse` and rejects if past.",
+        "height": 320,
+        "width": 380,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-700, 380],
+      "typeVersion": 1,
+      "id": "sticky-tz",
+      "name": "Note: Timezones"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "acme-studio-wa",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 200],
+      "id": "11111111-aaaa-aaaa-aaaa-111111111111",
+      "name": "Webhook: Evolution API",
+      "webhookId": "acme-studio-wa-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO message_idempotency (message_id, business_id) VALUES ($1::TEXT, $2::UUID) ON CONFLICT (message_id) DO NOTHING RETURNING message_id;",
+        "options": {
+          "queryReplacement": "={{ ($json.body && $json.body.data && $json.body.data.key && $json.body.data.key.id) || $json.body && $json.body.message_id || ('mid_' + Date.now()) }},{{ $env.BUSINESS_ID }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-20, 200],
+      "id": "22222222-aaaa-aaaa-aaaa-222222222222",
+      "name": "Idempotency Insert",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_BOOKING_DB_CRED_ID", "name": "booking_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.message_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [160, 200],
+      "id": "33333333-aaaa-aaaa-aaaa-333333333333",
+      "name": "IF: New Message?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"already_processed\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [340, 80],
+      "id": "44444444-aaaa-aaaa-aaaa-444444444444",
+      "name": "Respond 200 (duplicate)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Evolution API webhook payload.\n// Evolution wraps the message in body.data.message. Adapt if your version differs.\nconst raw = JSON.parse(JSON.stringify($('Webhook: Evolution API').item.json));\nconst body = raw.body || raw;\nconst data = (body && body.data) || {};\nconst key  = data.key || {};\nconst msg  = data.message || {};\n\n// Phone normalization (drop @s.whatsapp.net suffix)\nconst remoteJid = String(key.remoteJid || data.remoteJid || '');\nconst phone = remoteJid.split('@')[0];\n\n// Text from the various Evolution payload shapes (text, extendedText, conversation)\nconst text = msg.conversation || msg.text || (msg.extendedTextMessage && msg.extendedTextMessage.text) || '';\nconst push_name = data.pushName || data.push_name || null;\nconst is_from_me = key.fromMe === true;\n\nif (is_from_me) throw new Error('SKIP_OWN_MESSAGE');\nif (!phone) throw new Error('INVALID_PAYLOAD: missing phone');\n\nconst session_key = `${$env.BUSINESS_ID}:${phone}`;\n\nreturn [{ json: {\n  message_id: key.id || null,\n  phone,\n  push_name,\n  text: String(text).trim(),\n  session_key,\n  received_at: new Date().toISOString()\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 200],
+      "id": "55555555-aaaa-aaaa-aaaa-555555555555",
+      "name": "Parse Evolution Payload"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO booking_sessions (session_key, business_id, phone, state, context, last_message_at, expires_at) VALUES ($1, $2::UUID, $3, 'IDLE', '{}'::JSONB, NOW(), NOW() + INTERVAL '30 minutes') ON CONFLICT (session_key) DO UPDATE SET last_message_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' RETURNING session_key, state, context, expires_at;",
+        "options": {
+          "queryReplacement": "={{ $json.session_key }},{{ $env.BUSINESS_ID }},{{ $json.phone }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 200],
+      "id": "66666666-aaaa-aaaa-aaaa-666666666666",
+      "name": "Load/Init Session",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_BOOKING_DB_CRED_ID", "name": "booking_db" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($env.GOOGLE_CALENDAR_ID) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "timeMin",      "value": "={{ new Date().toISOString() }}" },
+            { "name": "timeMax",      "value": "={{ new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString() }}" },
+            { "name": "singleEvents", "value": "true" },
+            { "name": "orderBy",      "value": "startTime" },
+            { "name": "maxResults",   "value": "100" }
+          ]
+        },
+        "options": { "timeout": 8000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 200],
+      "id": "77777777-aaaa-aaaa-aaaa-777777777777",
+      "name": "GCal: Fetch Busy (14d)",
+      "credentials": {
+        "googleCalendarOAuth2Api": { "id": "REPLACE_WITH_GCAL_OAUTH_CRED_ID", "name": "google_calendar_oauth" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build LLM context: merge session state + busy slots + service catalog.\n// Materialize proxies (avoid Task Runner timeout on nested objects).\nconst parsed = JSON.parse(JSON.stringify($('Parse Evolution Payload').item.json));\nconst session = JSON.parse(JSON.stringify($('Load/Init Session').item.json));\nconst gcalRaw = JSON.parse(JSON.stringify($input.item.json));\n\nconst busy = (gcalRaw.items || []).map(ev => ({\n  start: ev.start && (ev.start.dateTime || ev.start.date),\n  end:   ev.end   && (ev.end.dateTime   || ev.end.date),\n  summary: ev.summary || null\n}));\n\n// Service catalog hardcoded for the demo (in production, SELECT FROM services).\nconst services = [\n  { id: '11111111-aaaa-bbbb-cccc-111111111111', name: 'Classic haircut',     duration_min: 30, price: 25 },\n  { id: '22222222-aaaa-bbbb-cccc-222222222222', name: 'Haircut + beard',     duration_min: 45, price: 38 },\n  { id: '33333333-aaaa-bbbb-cccc-333333333333', name: 'Hair color',          duration_min: 90, price: 75 },\n  { id: '44444444-aaaa-bbbb-cccc-444444444444', name: 'Manicure',            duration_min: 45, price: 30 }\n];\n\nconst tz = $env.BUSINESS_TIMEZONE || 'America/Argentina/Buenos_Aires';\nconst lang = ($env.BOT_LANG || 'en').toLowerCase().startsWith('es') ? 'es' : 'en';\nconst nowInTz = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());\n\nreturn [{ json: {\n  ...parsed,\n  state: session.state || 'IDLE',\n  context: session.context || {},\n  busy,\n  services,\n  business_timezone: tz,\n  current_time_local: nowInTz,\n  lang\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 200],
+      "id": "88888888-aaaa-aaaa-aaaa-888888888888",
+      "name": "Build LLM Context"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $env.LLM_PROVIDER || 'openai' }}", "rightValue": "openai", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "openai"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $env.LLM_PROVIDER || 'openai' }}", "rightValue": "anthropic", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "anthropic"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1060, 200],
+      "id": "99999999-aaaa-aaaa-aaaa-999999999999",
+      "name": "Switch: LLM Provider"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.OPENAI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": {{ JSON.stringify('You are the booking assistant for ACME Studio (a barbershop). Decide the next action and extract data. Return EXCLUSIVELY a JSON object: { \"intent\": \"book\"|\"consult\"|\"cancel\"|\"reschedule\"|\"fallback\", \"next_action\": \"greet\"|\"ask_service\"|\"ask_date\"|\"ask_time\"|\"show_slots\"|\"confirm_booking\"|\"fallback\", \"extracted\": { \"service_id\": null, \"service_name\": null, \"start_at\": null, \"user_confirmed\": false }, \"user_message\": \"<reply to the user>\" }. start_at MUST be ISO-8601 with timezone offset. user_confirmed=true ONLY when the user explicitly says yes. Respond in ' + ($json.lang === 'es' ? 'Spanish (rioplatense, voseo).' : 'English.')) }} },\n    { \"role\": \"user\", \"content\": {{ JSON.stringify('Current state: ' + $json.state + '\\nContext: ' + JSON.stringify($json.context) + '\\nNow (' + $json.business_timezone + '): ' + $json.current_time_local + '\\nServices: ' + JSON.stringify($json.services) + '\\nBusy slots (next 14d): ' + JSON.stringify($json.busy.slice(0, 30)) + '\\n\\nUser message: ' + $json.text) }} }\n  ]\n}",
+        "options": { "timeout": 20000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 80],
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1",
+      "name": "OpenAI"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-5\",\n  \"max_tokens\": 1024,\n  \"system\": {{ JSON.stringify('You are the booking assistant for ACME Studio (a barbershop). Decide the next action and extract data. Return EXCLUSIVELY a JSON object: { \"intent\": \"book\"|\"consult\"|\"cancel\"|\"reschedule\"|\"fallback\", \"next_action\": \"greet\"|\"ask_service\"|\"ask_date\"|\"ask_time\"|\"show_slots\"|\"confirm_booking\"|\"fallback\", \"extracted\": { \"service_id\": null, \"service_name\": null, \"start_at\": null, \"user_confirmed\": false }, \"user_message\": \"<reply to the user>\" }. start_at MUST be ISO-8601 with timezone offset. user_confirmed=true ONLY when the user explicitly says yes. Respond in ' + ($json.lang === 'es' ? 'Spanish (rioplatense, voseo).' : 'English.')) }},\n  \"messages\": [\n    { \"role\": \"user\", \"content\": {{ JSON.stringify('Current state: ' + $json.state + '\\nContext: ' + JSON.stringify($json.context) + '\\nNow (' + $json.business_timezone + '): ' + $json.current_time_local + '\\nServices: ' + JSON.stringify($json.services) + '\\nBusy slots (next 14d): ' + JSON.stringify($json.busy.slice(0, 30)) + '\\n\\nUser message: ' + $json.text) }} }\n  ]\n}",
+        "options": { "timeout": 20000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 320],
+      "id": "bbbbbbbb-aaaa-aaaa-aaaa-bbbbbbbbbbb1",
+      "name": "Anthropic"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize LLM response across providers + whitelist-validate next_action.\nconst ctx = JSON.parse(JSON.stringify($('Build LLM Context').item.json));\nconst raw = JSON.parse(JSON.stringify($input.item.json));\nconst provider = $env.LLM_PROVIDER || 'openai';\n\nconst ALLOWED_INTENTS = ['book', 'consult', 'cancel', 'reschedule', 'fallback'];\nconst ALLOWED_ACTIONS = ['greet', 'ask_service', 'ask_date', 'ask_time', 'show_slots', 'confirm_booking', 'fallback'];\n\nlet content = '';\nlet parsed = null;\nlet parse_error = null;\n\ntry {\n  if (provider === 'openai') {\n    content = raw.choices && raw.choices[0] && raw.choices[0].message ? raw.choices[0].message.content : '';\n  } else if (provider === 'anthropic') {\n    content = raw.content && raw.content[0] && raw.content[0].text ? raw.content[0].text : '';\n  }\n  const m = content.match(/\\{[\\s\\S]*\\}/);\n  if (m) parsed = JSON.parse(m[0]);\n} catch (e) {\n  parse_error = e.message;\n}\n\n// Whitelist validation: any value outside allowed sets falls back to safe defaults.\nconst intent = parsed && ALLOWED_INTENTS.includes(parsed.intent) ? parsed.intent : 'fallback';\nconst next_action = parsed && ALLOWED_ACTIONS.includes(parsed.next_action) ? parsed.next_action : 'fallback';\nconst extracted = (parsed && typeof parsed.extracted === 'object') ? parsed.extracted : {};\nconst user_message = (parsed && parsed.user_message) ? String(parsed.user_message) : '';\n\n// Validate start_at if provided: must parse + be in the future.\nlet start_at_iso = null;\nif (extracted.start_at) {\n  const t = Date.parse(extracted.start_at);\n  if (!isNaN(t) && t > Date.now()) start_at_iso = new Date(t).toISOString();\n}\n\nconst service = extracted.service_id\n  ? ctx.services.find(s => s.id === extracted.service_id)\n  : (extracted.service_name ? ctx.services.find(s => s.name.toLowerCase() === String(extracted.service_name).toLowerCase()) : null);\n\nreturn [{ json: {\n  ...ctx,\n  llm_provider: provider,\n  llm_raw: raw,\n  intent,\n  next_action,\n  extracted: {\n    service: service || null,\n    start_at: start_at_iso,\n    user_confirmed: extracted.user_confirmed === true\n  },\n  user_message,\n  parse_error\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 200],
+      "id": "cccccccc-aaaa-aaaa-aaaa-cccccccccccc",
+      "name": "Normalize & Validate LLM"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $json.next_action }}",                  "rightValue": "confirm_booking", "operator": { "type": "string", "operation": "equals" } },
+                  { "leftValue": "={{ $json.extracted.user_confirmed }}",     "rightValue": true,              "operator": { "type": "boolean", "operation": "true" } },
+                  { "leftValue": "={{ $json.extracted.service }}",            "rightValue": "",                "operator": { "type": "object", "operation": "notEmpty" } },
+                  { "leftValue": "={{ $json.extracted.start_at }}",           "rightValue": "",                "operator": { "type": "string", "operation": "notEmpty" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "book"
+            }
+          ],
+          "options": { "fallbackOutput": "extra" }
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1600, 200],
+      "id": "dddddddd-aaaa-aaaa-aaaa-dddddddddddd",
+      "name": "Switch: Action"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bookings (business_id, service_id, start_at, end_at, customer_phone, customer_name, status, created_at) VALUES ($1::UUID, $2::UUID, $3::TIMESTAMPTZ, ($3::TIMESTAMPTZ + ($4 || ' minutes')::INTERVAL), $5, $6, 'PENDING', NOW()) ON CONFLICT (service_id, start_at) WHERE status IN ('PENDING','CONFIRMED') DO NOTHING RETURNING id, start_at, end_at;",
+        "options": {
+          "queryReplacement": "={{ $env.BUSINESS_ID }},{{ $json.extracted.service.id }},{{ $json.extracted.start_at }},{{ $json.extracted.service.duration_min }},{{ $json.phone }},{{ $json.push_name || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1780, 80],
+      "id": "eeeeeeee-aaaa-aaaa-aaaa-eeeeeeeeeeee",
+      "name": "Insert Pending Booking",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_BOOKING_DB_CRED_ID", "name": "booking_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($env.GOOGLE_CALENDAR_ID) }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"summary\":     {{ JSON.stringify($('Normalize & Validate LLM').item.json.extracted.service.name + ' - ' + ($('Normalize & Validate LLM').item.json.push_name || $('Normalize & Validate LLM').item.json.phone)) }},\n  \"description\": {{ JSON.stringify('Booked via WhatsApp. Phone: ' + $('Normalize & Validate LLM').item.json.phone + '. Booking ID: ' + $json.id) }},\n  \"start\": { \"dateTime\": {{ JSON.stringify($json.start_at) }}, \"timeZone\": {{ JSON.stringify($env.BUSINESS_TIMEZONE) }} },\n  \"end\":   { \"dateTime\": {{ JSON.stringify($json.end_at) }},   \"timeZone\": {{ JSON.stringify($env.BUSINESS_TIMEZONE) }} }\n}",
+        "options": { "timeout": 8000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1960, 80],
+      "id": "ffffffff-aaaa-aaaa-aaaa-ffffffffffff",
+      "name": "GCal: Create Event",
+      "credentials": {
+        "googleCalendarOAuth2Api": { "id": "REPLACE_WITH_GCAL_OAUTH_CRED_ID", "name": "google_calendar_oauth" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bookings SET status = 'CONFIRMED', google_event_id = $2 WHERE id = $1::UUID RETURNING id, status, start_at, end_at, google_event_id;",
+        "options": {
+          "queryReplacement": "={{ $('Insert Pending Booking').item.json.id }},{{ $json.id || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2140, 80],
+      "id": "12121212-aaaa-aaaa-aaaa-121212121212",
+      "name": "Mark Booking Confirmed",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_BOOKING_DB_CRED_ID", "name": "booking_db" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compose response (i18n) and figure out next state.\n// Branch input: either 'book' (after Mark Confirmed) or 'extra' (everything else).\n// We detect which branch via $('Mark Booking Confirmed') existing & non-empty.\nconst llm = JSON.parse(JSON.stringify($('Normalize & Validate LLM').item.json));\nconst lang = llm.lang;\n\n// Did we just complete a booking?\nlet booking = null;\ntry {\n  const bk = $('Mark Booking Confirmed').item;\n  if (bk && bk.json && bk.json.status === 'CONFIRMED') {\n    booking = JSON.parse(JSON.stringify(bk.json));\n  }\n} catch (e) { /* not in book branch */ }\n\nlet pending = null;\ntry {\n  const ip = $('Insert Pending Booking').item;\n  if (ip && ip.json && (!ip.json.id || ip.json.id === undefined)) pending = 'taken';\n} catch (e) { /* not in book branch */ }\n\nconst T = {\n  en: {\n    booked: (svc, when) => `Confirmed! Your ${svc} is booked for ${when}. See you then. Reply CANCEL to cancel.`,\n    taken:  () => `Sorry — that slot was just taken by someone else. Pick another time?`,\n    fallback_help: () => `Sorry, I didn't catch that. You can ask me to book, check, or cancel an appointment.`\n  },\n  es: {\n    booked: (svc, when) => `Listo! Te reservé ${svc} para ${when}. Te esperamos. Respondé CANCELAR si querés cancelar.`,\n    taken:  () => `Uy — ese horario lo acaba de tomar otra persona. Probamos con otro?`,\n    fallback_help: () => `No entendí del todo. Podés pedir un turno, consultar uno, o cancelar.`\n  }\n}[lang];\n\nconst tz = llm.business_timezone;\nconst fmt = (iso) => new Intl.DateTimeFormat(lang === 'es' ? 'es-AR' : 'en-US', { timeZone: tz, weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));\n\nlet reply_text;\nlet next_state;\nlet next_context = llm.context || {};\n\nif (booking) {\n  reply_text = T.booked(llm.extracted.service.name, fmt(booking.start_at));\n  next_state = 'BOOKED';\n  next_context = { booking_id: booking.id, service_id: llm.extracted.service.id, start_at: booking.start_at };\n} else if (pending === 'taken') {\n  reply_text = T.taken();\n  next_state = 'BOOKING_TIME';  // ask for another time\n  next_context = { ...next_context, service_id: llm.extracted.service && llm.extracted.service.id };\n} else if (llm.user_message) {\n  reply_text = llm.user_message;\n  // State transition driven by next_action\n  const STATE_BY_ACTION = {\n    greet: 'IDLE',\n    ask_service: 'BOOKING_SERVICE',\n    ask_date: 'BOOKING_DATE',\n    ask_time: 'BOOKING_TIME',\n    show_slots: 'BOOKING_TIME',\n    confirm_booking: 'BOOKING_CONFIRM',\n    fallback: llm.state\n  };\n  next_state = STATE_BY_ACTION[llm.next_action] || llm.state;\n  if (llm.extracted.service) next_context.service_id = llm.extracted.service.id;\n  if (llm.extracted.start_at) next_context.tentative_start_at = llm.extracted.start_at;\n} else {\n  reply_text = T.fallback_help();\n  next_state = 'IDLE';\n}\n\nreturn [{ json: {\n  ...llm,\n  reply_text,\n  next_state,\n  next_context,\n  booking\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2320, 200],
+      "id": "13131313-aaaa-aaaa-aaaa-131313131313",
+      "name": "Compose Response"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO booking_sessions (session_key, business_id, phone, state, context, last_message_at, expires_at) VALUES ($1, $2::UUID, $3, $4, $5::JSONB, NOW(), NOW() + INTERVAL '30 minutes') ON CONFLICT (session_key) DO UPDATE SET state = EXCLUDED.state, context = EXCLUDED.context, last_message_at = NOW(), expires_at = EXCLUDED.expires_at RETURNING session_key, state;",
+        "options": {
+          "queryReplacement": "={{ $json.session_key }},{{ $env.BUSINESS_ID }},{{ $json.phone }},{{ $json.next_state }},{{ JSON.stringify($json.next_context) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2500, 200],
+      "id": "14141414-aaaa-aaaa-aaaa-141414141414",
+      "name": "Update Session State",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_BOOKING_DB_CRED_ID", "name": "booking_db" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EVOLUTION_API_URL }}/message/sendText/{{ $env.EVOLUTION_INSTANCE }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",       "value": "={{ $env.EVOLUTION_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"number\": {{ JSON.stringify($('Compose Response').item.json.phone) }},\n  \"text\":   {{ JSON.stringify($('Compose Response').item.json.reply_text) }}\n}",
+        "options": { "timeout": 8000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2680, 200],
+      "id": "15151515-aaaa-aaaa-aaaa-151515151515",
+      "name": "Send WhatsApp",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"session_key\": {{ JSON.stringify($('Compose Response').item.json.session_key) }}, \"next_state\": {{ JSON.stringify($('Compose Response').item.json.next_state) }}, \"reply\": {{ JSON.stringify($('Compose Response').item.json.reply_text) }}, \"booking\": {{ JSON.stringify($('Compose Response').item.json.booking || null) }} }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2860, 200],
+      "id": "16161616-aaaa-aaaa-aaaa-161616161616",
+      "name": "Respond Webhook"
+    }
+  ],
+  "connections": {
+    "Webhook: Evolution API":      { "main": [[{ "node": "Idempotency Insert", "type": "main", "index": 0 }]] },
+    "Idempotency Insert":          { "main": [[{ "node": "IF: New Message?",  "type": "main", "index": 0 }]] },
+    "IF: New Message?":            {
+      "main": [
+        [{ "node": "Parse Evolution Payload",   "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 (duplicate)",   "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Evolution Payload":     { "main": [[{ "node": "Load/Init Session",       "type": "main", "index": 0 }]] },
+    "Load/Init Session":           { "main": [[{ "node": "GCal: Fetch Busy (14d)",  "type": "main", "index": 0 }]] },
+    "GCal: Fetch Busy (14d)":      { "main": [[{ "node": "Build LLM Context",       "type": "main", "index": 0 }]] },
+    "Build LLM Context":           { "main": [[{ "node": "Switch: LLM Provider",    "type": "main", "index": 0 }]] },
+    "Switch: LLM Provider":        {
+      "main": [
+        [{ "node": "OpenAI",    "type": "main", "index": 0 }],
+        [{ "node": "Anthropic", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI":                      { "main": [[{ "node": "Normalize & Validate LLM", "type": "main", "index": 0 }]] },
+    "Anthropic":                   { "main": [[{ "node": "Normalize & Validate LLM", "type": "main", "index": 0 }]] },
+    "Normalize & Validate LLM":    { "main": [[{ "node": "Switch: Action",           "type": "main", "index": 0 }]] },
+    "Switch: Action":              {
+      "main": [
+        [{ "node": "Insert Pending Booking", "type": "main", "index": 0 }],
+        [{ "node": "Compose Response",       "type": "main", "index": 0 }]
+      ]
+    },
+    "Insert Pending Booking":      { "main": [[{ "node": "GCal: Create Event",     "type": "main", "index": 0 }]] },
+    "GCal: Create Event":          { "main": [[{ "node": "Mark Booking Confirmed", "type": "main", "index": 0 }]] },
+    "Mark Booking Confirmed":      { "main": [[{ "node": "Compose Response",       "type": "main", "index": 0 }]] },
+    "Compose Response":            { "main": [[{ "node": "Update Session State",   "type": "main", "index": 0 }]] },
+    "Update Session State":        { "main": [[{ "node": "Send WhatsApp",          "type": "main", "index": 0 }]] },
+    "Send WhatsApp":               { "main": [[{ "node": "Respond Webhook",        "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "version": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

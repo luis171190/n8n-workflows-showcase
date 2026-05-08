@@ -1,0 +1,159 @@
+{
+  "info": {
+    "_postman_id": "b1c2d3e4-5f6a-7b8c-9d0e-1f2a3b4c5d6e",
+    "name": "ACME Studio — WhatsApp Booking System",
+    "description": "End-to-end requests for the `whatsapp-booking-system` n8n workflow.\n\nThe collection drives a full booking conversation (greet → service → datetime → confirm → BOOKED) plus an idempotency replay test, simulating Evolution API webhook payloads. Each request includes automated tests that assert response shape and state transitions.\n\n## Usage\n\n1. Import this file in Postman.\n2. Create a Postman environment with these variables:\n   - `base_url` — your n8n instance, e.g. `https://your-n8n.example.com`\n   - `webhook_path` — `/webhook/acme-studio-wa` (default)\n   - `test_phone` — `5491100000001` (the JID without the @s.whatsapp.net suffix)\n   - `bot_lang` — `es` or `en` (informational only; actual language is set by `BOT_LANG` env in n8n)\n3. Run the requests **in order** — they share the same `session_key` and the conversation state persists in `booking_sessions`.\n\n## Schema asserted on every request\n\n```ts\n{\n  status: 'ok' | 'already_processed',\n  session_key?: string,\n  next_state?: 'IDLE'|'BOOKING_SERVICE'|'BOOKING_DATE'|'BOOKING_TIME'|'BOOKING_CONFIRM'|'BOOKED',\n  reply?: string,\n  booking?: { id, status, start_at, end_at, google_event_id } | null\n}\n```\n\n## Reset between runs\n\nTo replay the conversation from scratch, run this SQL once:\n\n```sql\nDELETE FROM booking_sessions WHERE phone = '5491100000001';\nDELETE FROM message_idempotency WHERE message_id LIKE 'MSG_TEST_%';\nDELETE FROM bookings WHERE customer_phone = '5491100000001';\n```",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Greeting — first message of the conversation",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"data\": {\n    \"key\": { \"remoteJid\": \"{{test_phone}}@s.whatsapp.net\", \"fromMe\": false, \"id\": \"MSG_TEST_0001\" },\n    \"pushName\": \"Test User\",\n    \"message\": { \"conversation\": \"Hola, querría reservar un turno\" }\n  }\n}"
+        },
+        "url": { "raw": "{{base_url}}{{webhook_path}}", "host": ["{{base_url}}{{webhook_path}}"] },
+        "description": "**Demonstrates:** session creation + intent detection.\n\n- `Idempotency Insert` succeeds (new `message_id`).\n- `Load/Init Session` UPSERTs a fresh row with `state='IDLE'`.\n- LLM classifies intent=`book`, next_action=`ask_service`, returns greeting + service question.\n- `next_state` becomes `BOOKING_SERVICE`.\n\n**Expected:** `next_state = 'BOOKING_SERVICE'`, `booking = null`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Schema valid', () => {",
+              "    pm.expect(body).to.have.property('status', 'ok');",
+              "    pm.expect(body).to.have.property('session_key').that.is.a('string');",
+              "    pm.expect(body).to.have.property('reply').that.is.a('string').and.has.length.greaterThan(0);",
+              "    pm.expect(body).to.have.property('next_state');",
+              "});",
+              "pm.test('Transitioned out of IDLE', () => {",
+              "    pm.expect(['BOOKING_SERVICE','BOOKING_DATE','BOOKING_TIME','IDLE']).to.include(body.next_state);",
+              "});",
+              "pm.test('No booking yet', () => {",
+              "    pm.expect(body.booking).to.be.null;",
+              "});",
+              "// Save session_key for downstream requests",
+              "pm.environment.set('session_key', body.session_key);"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Service + datetime — moves to BOOKING_CONFIRM",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"data\": {\n    \"key\": { \"remoteJid\": \"{{test_phone}}@s.whatsapp.net\", \"fromMe\": false, \"id\": \"MSG_TEST_0002\" },\n    \"pushName\": \"Test User\",\n    \"message\": { \"conversation\": \"Corte clásico, mañana a las 11am\" }\n  }\n}"
+        },
+        "url": { "raw": "{{base_url}}{{webhook_path}}", "host": ["{{base_url}}{{webhook_path}}"] },
+        "description": "**Demonstrates:** slot filling in a single turn.\n\n- LLM extracts both `service_id` (Classic haircut) and `start_at` (parsed from \"mañana a las 11am\" against the business TZ).\n- Validation: `Date.parse(start_at)` succeeds and resolves in the future.\n- `Switch: Action` does NOT route to `book` because `user_confirmed=false` (user has not said yes yet).\n- `next_state` becomes `BOOKING_CONFIRM`. The reply asks for confirmation.\n\n**Expected:** `next_state = 'BOOKING_CONFIRM'`, no booking yet."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('No booking yet (waiting for explicit yes)', () => {",
+              "    pm.expect(body.booking).to.be.null;",
+              "});",
+              "pm.test('Same session as request 1', () => {",
+              "    pm.expect(body.session_key).to.equal(pm.environment.get('session_key'));",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Confirm — two-phase commit + booking persisted",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"data\": {\n    \"key\": { \"remoteJid\": \"{{test_phone}}@s.whatsapp.net\", \"fromMe\": false, \"id\": \"MSG_TEST_0003\" },\n    \"pushName\": \"Test User\",\n    \"message\": { \"conversation\": \"Sí, confirmo\" }\n  }\n}"
+        },
+        "url": { "raw": "{{base_url}}{{webhook_path}}", "host": ["{{base_url}}{{webhook_path}}"] },
+        "description": "**Demonstrates:** the two-phase commit lite.\n\n1. `Insert Pending Booking` runs `INSERT … ON CONFLICT DO NOTHING RETURNING id`. Wins the slot atomically.\n2. `GCal: Create Event` POSTs to Google Calendar.\n3. `Mark Booking Confirmed` updates `status='CONFIRMED'` with `google_event_id`.\n4. `Compose Response` sees the confirmed booking and returns the success reply.\n\nIf step 1 returns 0 rows (race condition), the rest is skipped and the user receives 'slot just got taken, pick another'.\n\n**Expected (happy path):** `next_state = 'BOOKED'`, `booking.status = 'CONFIRMED'`, `booking.google_event_id` non-empty."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Schema valid', () => {",
+              "    pm.expect(body).to.have.property('status', 'ok');",
+              "    pm.expect(body).to.have.property('next_state');",
+              "});",
+              "pm.test('Either booked or recovered from race', () => {",
+              "    if (body.booking) {",
+              "        pm.expect(body.next_state).to.equal('BOOKED');",
+              "        pm.expect(body.booking.status).to.equal('CONFIRMED');",
+              "        pm.expect(body.booking).to.have.property('start_at').that.is.a('string');",
+              "        pm.expect(body.booking).to.have.property('end_at').that.is.a('string');",
+              "    } else {",
+              "        // Race lost or LLM didn't capture user_confirmed correctly",
+              "        pm.expect(body.next_state).to.be.oneOf(['BOOKING_TIME','BOOKING_CONFIRM']);",
+              "    }",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Idempotency — replay of MSG_TEST_0001",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"data\": {\n    \"key\": { \"remoteJid\": \"{{test_phone}}@s.whatsapp.net\", \"fromMe\": false, \"id\": \"MSG_TEST_0001\" },\n    \"pushName\": \"Test User\",\n    \"message\": { \"conversation\": \"Hola, querría reservar un turno\" }\n  }\n}"
+        },
+        "url": { "raw": "{{base_url}}{{webhook_path}}", "host": ["{{base_url}}{{webhook_path}}"] },
+        "description": "**Demonstrates:** idempotency.\n\nReplays the SAME `message_id` of request 1. Evolution API does this on timeouts. Without protection it would book twice, or send two replies.\n\n- `Idempotency Insert` returns 0 rows (PK conflict on `message_id`).\n- `IF: New?` routes to `Respond 200 (duplicate)` immediately.\n- No LLM call, no DB writes, no WhatsApp send.\n\n**Expected:** `status = 'already_processed'`, no other fields."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Marked as already_processed', () => {",
+              "    pm.expect(body.status).to.equal('already_processed');",
+              "});",
+              "pm.test('No side-effect fields', () => {",
+              "    pm.expect(body.next_state).to.be.undefined;",
+              "    pm.expect(body.booking).to.be.undefined;",
+              "    pm.expect(body.reply).to.be.undefined;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url",     "value": "https://your-n8n.example.com", "type": "string" },
+    { "key": "webhook_path", "value": "/webhook/acme-studio-wa",      "type": "string" },
+    { "key": "test_phone",   "value": "5491100000001",                "type": "string" },
+    { "key": "bot_lang",     "value": "es",                           "type": "string" }
+  ]
+}
