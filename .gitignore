@@ -1,0 +1,39 @@
+# Credentials & secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+secrets.json
+*.local.json
+
+# n8n exports con credenciales (sin filtrar)
+*-with-credentials.json
+*-private.json
+
+# Dependencies
+node_modules/
+__pycache__/
+venv/
+.venv/
+
+# Build / artifacts
+dist/
+build/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+*.tmp
+*.bak
+
+# Claude Code local
+.claude/settings.local.json
+.claude/projects/
