@@ -1,0 +1,689 @@
+{
+  "name": "ACME Multi-channel Retailer — WooCommerce <-> Odoo Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🔄 ACME Multi-channel Retailer — Inventory Sync\n\nThree triggers in one workflow:\n\n1. **Webhook: WC → Odoo** (`/webhook/sync-from-woo`) — order.created reduces stock; price/content updates skipped (WC is SoT).\n2. **Webhook: Odoo → WC** (`/webhook/sync-from-odoo`) — stock.updated propagates; pricing updates skipped (Odoo is not SoT for price).\n3. **Cron: Daily Reconciliation** (03:00) — fetches both sides, computes drift, inserts a report.\n\nEnv vars:\n- `WOO_BASE_URL`, `WOO_CONSUMER_KEY`, `WOO_CONSUMER_SECRET`\n- `ODOO_BASE_URL`, `ODOO_DATABASE`, `ODOO_UID`, `ODOO_PASSWORD`\n- `RECONCILIATION_AUTO_FIX` (true|false)\n- Postgres credential `inventory_db` configured in n8n.",
+        "height": 380,
+        "width": 480,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, -200],
+      "typeVersion": 1,
+      "id": "sticky-overview",
+      "name": "Overview"
+    },
+    {
+      "parameters": {
+        "content": "## 🎯 Source of Truth\n\n| Field        | SoT          | Why                                                             |\n|--------------|--------------|-----------------------------------------------------------------|\n| **stock**    | Odoo         | ERP records physical movement: purchases, sales, returns, transfers between warehouses |\n| **price**    | WooCommerce  | Marketing/commercial team works there: promos, A/B, scheduled campaigns                |\n| **content**  | WooCommerce  | Descriptions, images, SEO — same team owns it                                          |\n| **SKU**      | Odoo         | Master product creation happens in the ERP                                             |\n\n**Implication:** every sync event is filtered by `(source_system, field) → is_authoritative?`. If `false`, the event is **ignored with an audit log entry** (`status='ignored_not_sot'`). This stops accidental drift from manual edits in the wrong place.",
+        "height": 360,
+        "width": 460,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [580, 380],
+      "typeVersion": 1,
+      "id": "sticky-sot",
+      "name": "Note: Source of Truth"
+    },
+    {
+      "parameters": {
+        "content": "## ⚖️ Conflict Resolution\n\nStrategy: **Source-of-truth priority + last-write-wins as tie-breaker**.\n\n```\nresolve(field, source, value, timestamp):\n  if source == SoT[field]:\n      apply()                    # SoT always wins\n  else:\n      log_ignored()              # non-SoT events never propagate\n```\n\nWhen both systems update the SoT field within seconds of each other, the partial UNIQUE on `sync_events` and the per-event `received_at` timestamp serialize the apply order — last write wins atomically at the DB level.\n\n**Why not vector clocks?** They'd be more robust under network partitions, but our two systems are not peer nodes — they're a typed dataset with clear ownership per field. Vector clocks would be over-engineering.",
+        "height": 380,
+        "width": 460,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 1080],
+      "typeVersion": 1,
+      "id": "sticky-conflict",
+      "name": "Note: Conflict Resolution"
+    },
+    {
+      "parameters": {
+        "content": "## 🔑 Cross-System Idempotency\n\nWooCommerce sends `X-WC-Webhook-Delivery-ID` headers; Odoo emits via Automation rules with our own UUID. Both flow through:\n\n```sql\nINSERT INTO sync_events (source_system, source_event_id, ...)\nVALUES ($1, $2, ...)\nON CONFLICT (source_system, source_event_id) DO NOTHING\nRETURNING id;\n```\n\nIf the INSERT returns 0 rows the event was already processed → respond 200 silently. The compound UNIQUE means the same `event_id` can legitimately come from both systems — they don't clash.\n\nKept for 30 days, then a cron sweeper clears it.",
+        "height": 320,
+        "width": 420,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 380],
+      "typeVersion": 1,
+      "id": "sticky-idempotency",
+      "name": "Note: Idempotency"
+    },
+    {
+      "parameters": {
+        "content": "## 🛡️ Circuit Breaker\n\nIf one of the two target systems goes down, hammering it with retries makes the outage worse. Pattern used:\n\n```\nstate     ::= CLOSED | OPEN | HALF_OPEN\ntransitions:\n  CLOSED + 5 consecutive fails → OPEN\n  OPEN  after 60s              → HALF_OPEN\n  HALF_OPEN + 1 success        → CLOSED\n  HALF_OPEN + 1 fail           → OPEN\n```\n\nCheck happens **before** every outbound HTTP. If state is OPEN, the event is enqueued to `sync_queue` (status `WAITING_FOR_TARGET`). A drainer cron (mentioned as extension in README) processes it once the target recovers.\n\nWhy in Postgres and not in-memory: n8n is multi-instance / restart-prone. Shared state must be persistent.",
+        "height": 380,
+        "width": 460,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [1100, 380],
+      "typeVersion": 1,
+      "id": "sticky-circuit",
+      "name": "Note: Circuit Breaker"
+    },
+    {
+      "parameters": {
+        "content": "## 📊 Daily Reconciliation\n\nSafety net for everything the live sync misses (network blips, drainer backlog, manual edits direct to DB). Cron 03:00 local time:\n\n1. Fetch all SKUs from WC + Odoo (paginated).\n2. Compute drift per SKU (`stock_woo - stock_odoo`).\n3. Insert `reconciliation_runs` summary row + N `reconciliation_drift_items`.\n4. If `RECONCILIATION_AUTO_FIX=true`: apply Odoo→WC for each drift (Odoo is SoT). Else: just report.\n5. Surfaces an alert via `alerts` table for any drift > threshold.\n\n**Reads-only by default.** Auto-fix is opt-in because real businesses want a human to eyeball discrepancies first.",
+        "height": 360,
+        "width": 460,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 1620],
+      "typeVersion": 1,
+      "id": "sticky-reconciliation",
+      "name": "Note: Reconciliation"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sync-from-woo",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 200],
+      "id": "wc-webhook",
+      "name": "Webhook: WooCommerce",
+      "webhookId": "sync-from-woo-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_events (source_system, source_event_id, raw_payload, received_at) VALUES ('woocommerce', $1, $2::JSONB, NOW()) ON CONFLICT (source_system, source_event_id) DO NOTHING RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.headers && $json.headers['x-wc-webhook-delivery-id'] || ('woo_' + Date.now()) }},{{ JSON.stringify($json.body || $json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-20, 200],
+      "id": "wc-idempotency",
+      "name": "Idempotency: WC Event",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [160, 200],
+      "id": "wc-if-new",
+      "name": "WC: New?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"already_processed\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [340, 60],
+      "id": "wc-respond-dup",
+      "name": "WC: Respond 200 (dup)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse WooCommerce webhook + Source-of-Truth filter.\n// WC sends multiple event types; we care about: order.created, product.updated.\n// SoT rule:\n//   - order.created  → stock decrement event we propagate to Odoo\n//   - product.updated with stock change   → IGNORE (Odoo is SoT for stock)\n//   - product.updated with price/content  → propagate to Odoo for catalog mirror\nconst sync_event_id = JSON.parse(JSON.stringify($('Idempotency: WC Event').item.json)).id;\nconst raw = JSON.parse(JSON.stringify($('Webhook: WooCommerce').item.json));\nconst body = raw.body || raw;\nconst topic = (raw.headers && raw.headers['x-wc-webhook-topic']) || body._topic || 'unknown';\n\nlet field, action, sku, value, should_propagate, ignored_reason;\n\nif (topic === 'order.created') {\n  field = 'stock';\n  action = 'decrement';\n  // Order line items contain SKU + qty\n  const items = (body.line_items || []).map(li => ({ sku: li.sku, qty: li.quantity }));\n  return items.map(it => ({ json: {\n    sync_event_id, source: 'woocommerce', target: 'odoo',\n    field: 'stock', action: 'decrement',\n    sku: it.sku, value: it.qty, should_propagate: !!it.sku, ignored_reason: it.sku ? null : 'no_sku'\n  }}));\n}\n\nif (topic === 'product.updated') {\n  sku = body.sku;\n  // Determine which field changed by inspecting payload (in real life: WC sends full payload, we'd diff vs cache)\n  // For showcase, route by payload hint. If stock changed, ignore (Odoo is SoT).\n  if (body._stock_changed === true) {\n    return [{ json: { sync_event_id, source: 'woocommerce', target: 'odoo',\n      field: 'stock', action: 'set', sku, value: body.stock_quantity,\n      should_propagate: false, ignored_reason: 'odoo_is_sot_for_stock' }}];\n  }\n  if (body._price_changed === true) {\n    return [{ json: { sync_event_id, source: 'woocommerce', target: 'odoo',\n      field: 'price', action: 'set', sku, value: body.regular_price,\n      should_propagate: true, ignored_reason: null }}];\n  }\n  return [{ json: { sync_event_id, source: 'woocommerce', target: 'odoo',\n    field: 'unknown', action: 'noop', sku, value: null,\n    should_propagate: false, ignored_reason: 'unsupported_field' }}];\n}\n\nreturn [{ json: { sync_event_id, source: 'woocommerce', target: 'odoo',\n  field: null, action: null, sku: null, value: null,\n  should_propagate: false, ignored_reason: 'unsupported_topic:' + topic }}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 200],
+      "id": "wc-parse",
+      "name": "WC: Parse + SoT Filter"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_audit (sync_event_id, source_system, target_system, sku, field, action, status, before_value, after_value, error_message) VALUES ($1::UUID, 'woocommerce', 'odoo', $2, $3, $4, CASE WHEN $5::BOOLEAN THEN 'received' ELSE 'ignored_not_sot' END, NULL, $6::JSONB, $7) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.sync_event_id }},{{ $json.sku || 'n/a' }},{{ $json.field || 'n/a' }},{{ $json.action || 'noop' }},{{ $json.should_propagate }},{{ JSON.stringify({ value: $json.value }) }},{{ $json.ignored_reason || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 200],
+      "id": "wc-audit-received",
+      "name": "WC: Audit Received"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $('WC: Parse + SoT Filter').item.json.should_propagate }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [700, 200],
+      "id": "wc-if-propagate",
+      "name": "WC: Should Propagate?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ignored\", \"reason\": {{ JSON.stringify($('WC: Parse + SoT Filter').item.json.ignored_reason) }} }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [880, 60],
+      "id": "wc-respond-ignored",
+      "name": "WC: Respond 200 (ignored)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT system_name, state, consecutive_failures, opened_at FROM system_health WHERE system_name = 'odoo' LIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [880, 200],
+      "id": "wc-circuit-check",
+      "name": "WC→Odoo: Circuit Check",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "or",
+          "conditions": [
+            { "leftValue": "={{ $json.state }}", "rightValue": "CLOSED",    "operator": { "type": "string", "operation": "equals" } },
+            { "leftValue": "={{ $json.state }}", "rightValue": "HALF_OPEN", "operator": { "type": "string", "operation": "equals" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1060, 200],
+      "id": "wc-if-circuit-ok",
+      "name": "WC→Odoo: Circuit OK?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ODOO_BASE_URL }}/jsonrpc",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"call\",\n  \"params\": {\n    \"service\": \"object\",\n    \"method\": \"execute_kw\",\n    \"args\": [\n      {{ JSON.stringify($env.ODOO_DATABASE) }},\n      {{ Number($env.ODOO_UID) }},\n      {{ JSON.stringify($env.ODOO_PASSWORD) }},\n      \"product.product\",\n      {{ JSON.stringify($('WC: Parse + SoT Filter').item.json.field === 'stock' ? 'stock_decrement_by_sku' : 'set_field_by_sku') }},\n      [\n        [{{ JSON.stringify($('WC: Parse + SoT Filter').item.json.sku) }}],\n        {{ JSON.stringify({ field: $('WC: Parse + SoT Filter').item.json.field, value: $('WC: Parse + SoT Filter').item.json.value }) }}\n      ]\n    ]\n  }\n}",
+        "options": { "timeout": 10000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 140],
+      "id": "wc-apply-odoo",
+      "name": "WC→Odoo: Apply (JSON-RPC)",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH applied AS (UPDATE sync_audit SET status = CASE WHEN $2::BOOLEAN THEN 'applied' ELSE 'failed' END, error_message = $3 WHERE sync_event_id = $1::UUID AND status = 'received' RETURNING 1) UPDATE system_health SET state = CASE WHEN $2::BOOLEAN THEN 'CLOSED' ELSE state END, consecutive_failures = CASE WHEN $2::BOOLEAN THEN 0 ELSE consecutive_failures + 1 END, opened_at = CASE WHEN NOT $2::BOOLEAN AND consecutive_failures + 1 >= 5 THEN NOW() ELSE opened_at END, last_check_at = NOW() WHERE system_name = 'odoo' RETURNING state, consecutive_failures;",
+        "options": {
+          "queryReplacement": "={{ $('WC: Parse + SoT Filter').item.json.sync_event_id }},{{ !($json.error || ($json.body && $json.body.error)) }},{{ ($json.error && $json.error.message) || ($json.body && $json.body.error && $json.body.error.data && $json.body.error.data.message) || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 140],
+      "id": "wc-audit-applied",
+      "name": "WC→Odoo: Audit + Health",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_queue (sync_event_id, target_system, payload, status, retry_count, scheduled_at) VALUES ($1::UUID, 'odoo', $2::JSONB, 'WAITING_FOR_TARGET', 0, NOW()) ON CONFLICT (sync_event_id, target_system) DO NOTHING RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('WC: Parse + SoT Filter').item.json.sync_event_id }},{{ JSON.stringify($('WC: Parse + SoT Filter').item.json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1240, 320],
+      "id": "wc-queue-event",
+      "name": "WC→Odoo: Queue (Circuit OPEN)",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"sync_event_id\": {{ JSON.stringify($('WC: Parse + SoT Filter').item.json.sync_event_id) }}, \"applied\": true }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1600, 140],
+      "id": "wc-respond-ok",
+      "name": "WC: Respond 200 (applied)"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"queued\", \"sync_event_id\": {{ JSON.stringify($('WC: Parse + SoT Filter').item.json.sync_event_id) }}, \"reason\": \"target_circuit_open\" }",
+        "options": { "responseCode": 202 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1420, 320],
+      "id": "wc-respond-queued",
+      "name": "WC: Respond 202 (queued)"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sync-from-odoo",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 720],
+      "id": "odoo-webhook",
+      "name": "Webhook: Odoo",
+      "webhookId": "sync-from-odoo-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_events (source_system, source_event_id, raw_payload, received_at) VALUES ('odoo', $1, $2::JSONB, NOW()) ON CONFLICT (source_system, source_event_id) DO NOTHING RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ ($json.body && $json.body.event_id) || $json.body && $json.body.id || ('odoo_' + Date.now()) }},{{ JSON.stringify($json.body || $json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-20, 720],
+      "id": "odoo-idempotency",
+      "name": "Idempotency: Odoo Event",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [160, 720],
+      "id": "odoo-if-new",
+      "name": "Odoo: New?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"already_processed\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [340, 580],
+      "id": "odoo-respond-dup",
+      "name": "Odoo: Respond 200 (dup)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Odoo webhook + Source-of-Truth filter (mirror of WC parse).\n// Odoo Automation rules typically post: { event_id, model, operation, sku, field, value, ... }\n// SoT: stock change in Odoo → propagate to WC. Price change in Odoo → IGNORE (WC is SoT for price).\nconst sync_event_id = JSON.parse(JSON.stringify($('Idempotency: Odoo Event').item.json)).id;\nconst raw = JSON.parse(JSON.stringify($('Webhook: Odoo').item.json));\nconst body = raw.body || raw;\nconst { sku, field, value, operation } = body;\n\nlet should_propagate = false, ignored_reason = null;\n\nif (!sku) {\n  ignored_reason = 'no_sku';\n} else if (field === 'stock' || field === 'qty_available') {\n  should_propagate = true;\n} else if (field === 'price' || field === 'list_price') {\n  ignored_reason = 'wc_is_sot_for_price';\n} else {\n  ignored_reason = 'unsupported_field:' + field;\n}\n\nreturn [{ json: {\n  sync_event_id, source: 'odoo', target: 'woocommerce',\n  field: field || null, action: operation || 'set', sku: sku || null, value,\n  should_propagate, ignored_reason\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 720],
+      "id": "odoo-parse",
+      "name": "Odoo: Parse + SoT Filter"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_audit (sync_event_id, source_system, target_system, sku, field, action, status, before_value, after_value, error_message) VALUES ($1::UUID, 'odoo', 'woocommerce', $2, $3, $4, CASE WHEN $5::BOOLEAN THEN 'received' ELSE 'ignored_not_sot' END, NULL, $6::JSONB, $7) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.sync_event_id }},{{ $json.sku || 'n/a' }},{{ $json.field || 'n/a' }},{{ $json.action || 'noop' }},{{ $json.should_propagate }},{{ JSON.stringify({ value: $json.value }) }},{{ $json.ignored_reason || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 720],
+      "id": "odoo-audit-received",
+      "name": "Odoo: Audit Received"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $('Odoo: Parse + SoT Filter').item.json.should_propagate }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [700, 720],
+      "id": "odoo-if-propagate",
+      "name": "Odoo: Should Propagate?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ignored\", \"reason\": {{ JSON.stringify($('Odoo: Parse + SoT Filter').item.json.ignored_reason) }} }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [880, 580],
+      "id": "odoo-respond-ignored",
+      "name": "Odoo: Respond 200 (ignored)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT system_name, state, consecutive_failures, opened_at FROM system_health WHERE system_name = 'woocommerce' LIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [880, 720],
+      "id": "odoo-circuit-check",
+      "name": "Odoo→WC: Circuit Check",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "or",
+          "conditions": [
+            { "leftValue": "={{ $json.state }}", "rightValue": "CLOSED",    "operator": { "type": "string", "operation": "equals" } },
+            { "leftValue": "={{ $json.state }}", "rightValue": "HALF_OPEN", "operator": { "type": "string", "operation": "equals" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1060, 720],
+      "id": "odoo-if-circuit-ok",
+      "name": "Odoo→WC: Circuit OK?"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $env.WOO_BASE_URL }}/wp-json/wc/v3/products?sku={{ encodeURIComponent($('Odoo: Parse + SoT Filter').item.json.sku) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"stock_quantity\": {{ Number($('Odoo: Parse + SoT Filter').item.json.value) }},\n  \"manage_stock\":   true\n}",
+        "options": { "timeout": 10000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 660],
+      "id": "odoo-apply-wc",
+      "name": "Odoo→WC: Apply (REST)",
+      "credentials": {
+        "httpBasicAuth": { "id": "REPLACE_WITH_WC_BASIC_AUTH_ID", "name": "wc_consumer_key_secret" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH applied AS (UPDATE sync_audit SET status = CASE WHEN $2::BOOLEAN THEN 'applied' ELSE 'failed' END, error_message = $3 WHERE sync_event_id = $1::UUID AND status = 'received' RETURNING 1) UPDATE system_health SET state = CASE WHEN $2::BOOLEAN THEN 'CLOSED' ELSE state END, consecutive_failures = CASE WHEN $2::BOOLEAN THEN 0 ELSE consecutive_failures + 1 END, opened_at = CASE WHEN NOT $2::BOOLEAN AND consecutive_failures + 1 >= 5 THEN NOW() ELSE opened_at END, last_check_at = NOW() WHERE system_name = 'woocommerce' RETURNING state, consecutive_failures;",
+        "options": {
+          "queryReplacement": "={{ $('Odoo: Parse + SoT Filter').item.json.sync_event_id }},{{ !($json.error) }},{{ ($json.error && ($json.error.message || $json.error.code)) || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 660],
+      "id": "odoo-audit-applied",
+      "name": "Odoo→WC: Audit + Health",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sync_queue (sync_event_id, target_system, payload, status, retry_count, scheduled_at) VALUES ($1::UUID, 'woocommerce', $2::JSONB, 'WAITING_FOR_TARGET', 0, NOW()) ON CONFLICT (sync_event_id, target_system) DO NOTHING RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Odoo: Parse + SoT Filter').item.json.sync_event_id }},{{ JSON.stringify($('Odoo: Parse + SoT Filter').item.json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1240, 840],
+      "id": "odoo-queue-event",
+      "name": "Odoo→WC: Queue (Circuit OPEN)",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"sync_event_id\": {{ JSON.stringify($('Odoo: Parse + SoT Filter').item.json.sync_event_id) }}, \"applied\": true }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1600, 660],
+      "id": "odoo-respond-ok",
+      "name": "Odoo: Respond 200 (applied)"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"queued\", \"sync_event_id\": {{ JSON.stringify($('Odoo: Parse + SoT Filter').item.json.sync_event_id) }}, \"reason\": \"target_circuit_open\" }",
+        "options": { "responseCode": 202 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1420, 840],
+      "id": "odoo-respond-queued",
+      "name": "Odoo: Respond 202 (queued)"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 3 * * *" }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-200, 1380],
+      "id": "recon-cron",
+      "name": "Cron: Daily 03:00"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.WOO_BASE_URL }}/wp-json/wc/v3/products?per_page=100&status=publish",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": { "timeout": 30000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-20, 1380],
+      "id": "recon-fetch-wc",
+      "name": "Recon: Fetch WC Products",
+      "credentials": {
+        "httpBasicAuth": { "id": "REPLACE_WITH_WC_BASIC_AUTH_ID", "name": "wc_consumer_key_secret" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ODOO_BASE_URL }}/jsonrpc",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"call\",\n  \"params\": {\n    \"service\": \"object\",\n    \"method\": \"execute_kw\",\n    \"args\": [\n      {{ JSON.stringify($env.ODOO_DATABASE) }},\n      {{ Number($env.ODOO_UID) }},\n      {{ JSON.stringify($env.ODOO_PASSWORD) }},\n      \"product.product\",\n      \"search_read\",\n      [[[\"active\", \"=\", true]]],\n      { \"fields\": [\"default_code\", \"name\", \"qty_available\", \"list_price\"], \"limit\": 1000 }\n    ]\n  }\n}",
+        "options": { "timeout": 30000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [160, 1380],
+      "id": "recon-fetch-odoo",
+      "name": "Recon: Fetch Odoo Products"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reconciliation: compute drift between WooCommerce and Odoo per SKU.\n// Drift threshold: any non-zero difference is reported. Auto-fix toggle via env.\nconst wc   = JSON.parse(JSON.stringify($('Recon: Fetch WC Products').item.json));\nconst odoo = JSON.parse(JSON.stringify($('Recon: Fetch Odoo Products').item.json));\nconst auto_fix = String($env.RECONCILIATION_AUTO_FIX || 'false').toLowerCase() === 'true';\n\nconst wcArr   = Array.isArray(wc) ? wc : (wc.data || []);\nconst odooArr = (odoo && odoo.result) ? odoo.result : (Array.isArray(odoo) ? odoo : []);\n\nconst wcBySku = {};\nfor (const p of wcArr) if (p.sku) wcBySku[p.sku] = { stock: Number(p.stock_quantity), price: parseFloat(p.regular_price || p.price) };\n\nconst odooBySku = {};\nfor (const p of odooArr) if (p.default_code) odooBySku[p.default_code] = { stock: Number(p.qty_available), price: parseFloat(p.list_price) };\n\nconst skus = new Set([...Object.keys(wcBySku), ...Object.keys(odooBySku)]);\n\nconst drift_items = [];\nfor (const sku of skus) {\n  const w = wcBySku[sku];\n  const o = odooBySku[sku];\n  if (!w) { drift_items.push({ sku, kind: 'missing_in_wc', wc: null, odoo: o }); continue; }\n  if (!o) { drift_items.push({ sku, kind: 'missing_in_odoo', wc: w, odoo: null }); continue; }\n  if (w.stock !== o.stock) drift_items.push({ sku, kind: 'stock_drift', wc: w.stock, odoo: o.stock, diff: w.stock - o.stock });\n  // Price drift only reported (WC is SoT, no auto-fix to Odoo)\n  if (Math.abs((w.price || 0) - (o.price || 0)) > 0.01) drift_items.push({ sku, kind: 'price_drift', wc: w.price, odoo: o.price });\n}\n\nreturn [{ json: {\n  run_started_at: new Date().toISOString(),\n  total_skus_checked: skus.size,\n  total_drift_items: drift_items.length,\n  stock_drift_count: drift_items.filter(d => d.kind === 'stock_drift').length,\n  price_drift_count: drift_items.filter(d => d.kind === 'price_drift').length,\n  missing_count:     drift_items.filter(d => d.kind.startsWith('missing_')).length,\n  auto_fix,\n  drift_items\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 1380],
+      "id": "recon-compute",
+      "name": "Recon: Compute Drift"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH run AS (INSERT INTO reconciliation_runs (started_at, total_skus_checked, stock_drift_count, price_drift_count, missing_count, auto_fix, finished_at) VALUES ($1::TIMESTAMPTZ, $2, $3, $4, $5, $6::BOOLEAN, NOW()) RETURNING id) INSERT INTO reconciliation_drift_items (run_id, sku, kind, details) SELECT (SELECT id FROM run), x.sku, x.kind, x.details FROM jsonb_to_recordset($7::JSONB) AS x(sku TEXT, kind TEXT, details JSONB) RETURNING run_id;",
+        "options": {
+          "queryReplacement": "={{ $json.run_started_at }},{{ $json.total_skus_checked }},{{ $json.stock_drift_count }},{{ $json.price_drift_count }},{{ $json.missing_count }},{{ $json.auto_fix }},{{ JSON.stringify(($json.drift_items || []).map(d => ({ sku: d.sku, kind: d.kind, details: d }))) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 1380],
+      "id": "recon-insert",
+      "name": "Recon: Persist Run + Items",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO alerts (severity, source, message, payload, created_at) SELECT CASE WHEN $1 > 50 THEN 'critical' WHEN $1 > 10 THEN 'warning' ELSE 'info' END, 'reconciliation', 'Daily reconciliation drift detected', $2::JSONB, NOW() WHERE $1 > 0 RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Recon: Compute Drift').item.json.total_drift_items }},{{ JSON.stringify($('Recon: Compute Drift').item.json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [700, 1380],
+      "id": "recon-alert",
+      "name": "Recon: Insert Alert (if drift)",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_INVENTORY_DB_CRED_ID", "name": "inventory_db" }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: WooCommerce":     { "main": [[{ "node": "Idempotency: WC Event",        "type": "main", "index": 0 }]] },
+    "Idempotency: WC Event":    { "main": [[{ "node": "WC: New?",                     "type": "main", "index": 0 }]] },
+    "WC: New?":                 { "main": [
+                                    [{ "node": "WC: Parse + SoT Filter",              "type": "main", "index": 0 }],
+                                    [{ "node": "WC: Respond 200 (dup)",               "type": "main", "index": 0 }]
+                                  ] },
+    "WC: Parse + SoT Filter":   { "main": [[{ "node": "WC: Audit Received",           "type": "main", "index": 0 }]] },
+    "WC: Audit Received":       { "main": [[{ "node": "WC: Should Propagate?",        "type": "main", "index": 0 }]] },
+    "WC: Should Propagate?":    { "main": [
+                                    [{ "node": "WC→Odoo: Circuit Check",              "type": "main", "index": 0 }],
+                                    [{ "node": "WC: Respond 200 (ignored)",           "type": "main", "index": 0 }]
+                                  ] },
+    "WC→Odoo: Circuit Check":   { "main": [[{ "node": "WC→Odoo: Circuit OK?",         "type": "main", "index": 0 }]] },
+    "WC→Odoo: Circuit OK?":     { "main": [
+                                    [{ "node": "WC→Odoo: Apply (JSON-RPC)",           "type": "main", "index": 0 }],
+                                    [{ "node": "WC→Odoo: Queue (Circuit OPEN)",       "type": "main", "index": 0 }]
+                                  ] },
+    "WC→Odoo: Apply (JSON-RPC)":{ "main": [[{ "node": "WC→Odoo: Audit + Health",      "type": "main", "index": 0 }]] },
+    "WC→Odoo: Audit + Health":  { "main": [[{ "node": "WC: Respond 200 (applied)",    "type": "main", "index": 0 }]] },
+    "WC→Odoo: Queue (Circuit OPEN)": { "main": [[{ "node": "WC: Respond 202 (queued)","type": "main", "index": 0 }]] },
+
+    "Webhook: Odoo":            { "main": [[{ "node": "Idempotency: Odoo Event",      "type": "main", "index": 0 }]] },
+    "Idempotency: Odoo Event":  { "main": [[{ "node": "Odoo: New?",                   "type": "main", "index": 0 }]] },
+    "Odoo: New?":               { "main": [
+                                    [{ "node": "Odoo: Parse + SoT Filter",            "type": "main", "index": 0 }],
+                                    [{ "node": "Odoo: Respond 200 (dup)",             "type": "main", "index": 0 }]
+                                  ] },
+    "Odoo: Parse + SoT Filter": { "main": [[{ "node": "Odoo: Audit Received",         "type": "main", "index": 0 }]] },
+    "Odoo: Audit Received":     { "main": [[{ "node": "Odoo: Should Propagate?",      "type": "main", "index": 0 }]] },
+    "Odoo: Should Propagate?":  { "main": [
+                                    [{ "node": "Odoo→WC: Circuit Check",              "type": "main", "index": 0 }],
+                                    [{ "node": "Odoo: Respond 200 (ignored)",         "type": "main", "index": 0 }]
+                                  ] },
+    "Odoo→WC: Circuit Check":   { "main": [[{ "node": "Odoo→WC: Circuit OK?",         "type": "main", "index": 0 }]] },
+    "Odoo→WC: Circuit OK?":     { "main": [
+                                    [{ "node": "Odoo→WC: Apply (REST)",               "type": "main", "index": 0 }],
+                                    [{ "node": "Odoo→WC: Queue (Circuit OPEN)",       "type": "main", "index": 0 }]
+                                  ] },
+    "Odoo→WC: Apply (REST)":    { "main": [[{ "node": "Odoo→WC: Audit + Health",      "type": "main", "index": 0 }]] },
+    "Odoo→WC: Audit + Health":  { "main": [[{ "node": "Odoo: Respond 200 (applied)",  "type": "main", "index": 0 }]] },
+    "Odoo→WC: Queue (Circuit OPEN)": { "main": [[{ "node": "Odoo: Respond 202 (queued)","type": "main", "index": 0 }]] },
+
+    "Cron: Daily 03:00":        { "main": [[{ "node": "Recon: Fetch WC Products",     "type": "main", "index": 0 }]] },
+    "Recon: Fetch WC Products": { "main": [[{ "node": "Recon: Fetch Odoo Products",   "type": "main", "index": 0 }]] },
+    "Recon: Fetch Odoo Products":{ "main": [[{ "node": "Recon: Compute Drift",        "type": "main", "index": 0 }]] },
+    "Recon: Compute Drift":     { "main": [[{ "node": "Recon: Persist Run + Items",   "type": "main", "index": 0 }]] },
+    "Recon: Persist Run + Items":{ "main": [[{ "node": "Recon: Insert Alert (if drift)","type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "version": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

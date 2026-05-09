@@ -1,0 +1,217 @@
+{
+  "info": {
+    "_postman_id": "c2d3e4f5-6a7b-8c9d-0e1f-2a3b4c5d6e7f",
+    "name": "ACME Multi-channel — WooCommerce <-> Odoo Sync",
+    "description": "End-to-end requests for the `multi-store-inventory-sync` n8n workflow.\n\nCovers: order-induced stock sync, source-of-truth filtering (propagate vs ignore), idempotency dedup, and the circuit breaker queue path. Each request includes automated tests asserting both the response shape and the expected DB side-effects (you query `sync_audit` and `sync_events` between requests).\n\n## Usage\n\n1. Import this file in Postman.\n2. Set environment variables:\n   - `base_url` — your n8n instance, e.g. `https://your-n8n.example.com`\n   - `wc_path`   — `/webhook/sync-from-woo`\n   - `odoo_path` — `/webhook/sync-from-odoo`\n3. Run the requests **in order** — they share `delivery_id` patterns.\n\n## Reset DB between runs\n\n```sql\nTRUNCATE sync_audit, sync_events, sync_queue RESTART IDENTITY CASCADE;\nUPDATE system_health SET state='CLOSED', consecutive_failures=0, opened_at=NULL;\n```\n\n## Schemas asserted\n\n```ts\n// HTTP 200 (applied)\n{ status: 'ok', sync_event_id: string, applied: true }\n\n// HTTP 200 (ignored — non-SoT field)\n{ status: 'ignored', reason: string }\n\n// HTTP 200 (duplicate)\n{ status: 'already_processed' }\n\n// HTTP 202 (queued — circuit OPEN)\n{ status: 'queued', sync_event_id: string, reason: 'target_circuit_open' }\n```",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. WC order.created → applied to Odoo",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-wc-webhook-topic", "value": "order.created" },
+          { "key": "x-wc-webhook-delivery-id", "value": "WC_TEST_001" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 12345,\n  \"status\": \"processing\",\n  \"line_items\": [\n    { \"sku\": \"ACME-LAPTOP-15\", \"quantity\": 1, \"name\": \"ACME Laptop 15\\\"\" }\n  ]\n}"
+        },
+        "url": { "raw": "{{base_url}}{{wc_path}}", "host": ["{{base_url}}{{wc_path}}"] },
+        "description": "**Demonstrates:** the canonical happy path.\n\n- Idempotency Insert succeeds.\n- SoT filter sees `field=stock, action=decrement` and `should_propagate=true`.\n- Circuit Check returns CLOSED (Odoo healthy).\n- Apply (JSON-RPC) calls Odoo to decrement stock.\n- Audit + Health writes `applied` and resets failure counter.\n\n**Expected:** `{ status: 'ok', applied: true }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Applied path', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.applied).to.be.true;",
+              "    pm.expect(body.sync_event_id).to.be.a('string').and.have.length.greaterThan(8);",
+              "});",
+              "pm.environment.set('first_sync_event_id', body.sync_event_id);"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. WC stock change → IGNORED (Odoo is SoT)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-wc-webhook-topic", "value": "product.updated" },
+          { "key": "x-wc-webhook-delivery-id", "value": "WC_TEST_002" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 9001,\n  \"sku\": \"ACME-LAPTOP-15\",\n  \"_stock_changed\": true,\n  \"stock_quantity\": 50\n}"
+        },
+        "url": { "raw": "{{base_url}}{{wc_path}}", "host": ["{{base_url}}{{wc_path}}"] },
+        "description": "**Demonstrates:** the SoT filter blocking a non-authoritative update.\n\nA human edited stock directly in WC admin. WC is NOT the SoT for stock — Odoo is. Without this filter, propagating the WC stock to Odoo would overwrite the real (Odoo) stock with the stale WC stock.\n\nThe SoT filter sets `should_propagate=false, ignored_reason='odoo_is_sot_for_stock'`. The audit log records `status='ignored_not_sot'`. No HTTP call is made to Odoo.\n\n**Expected:** `{ status: 'ignored', reason: 'odoo_is_sot_for_stock' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Ignored due to SoT rule', () => {",
+              "    pm.expect(body.status).to.equal('ignored');",
+              "    pm.expect(body.reason).to.equal('odoo_is_sot_for_stock');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. WC price change → applied to Odoo",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-wc-webhook-topic", "value": "product.updated" },
+          { "key": "x-wc-webhook-delivery-id", "value": "WC_TEST_003" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 9001,\n  \"sku\": \"ACME-LAPTOP-15\",\n  \"_price_changed\": true,\n  \"regular_price\": \"1299.00\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{wc_path}}", "host": ["{{base_url}}{{wc_path}}"] },
+        "description": "**Demonstrates:** the SoT filter allowing the update because it matches the rule.\n\nWC is the SoT for price. Marketing edits prices in WC; Odoo gets the value mirrored. The opposite event (Odoo `list_price` change) would be ignored, as covered in `docs/architecture.md`.\n\n**Expected:** `{ status: 'ok', applied: true }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Applied (price is WC SoT)', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.applied).to.be.true;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Odoo stock.move → applied to WC",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"event_id\": \"ODOO_EVT_2026_05_08_001\",\n  \"model\": \"product.product\",\n  \"operation\": \"set\",\n  \"sku\": \"ACME-LAPTOP-15\",\n  \"field\": \"qty_available\",\n  \"value\": 47\n}"
+        },
+        "url": { "raw": "{{base_url}}{{odoo_path}}", "host": ["{{base_url}}{{odoo_path}}"] },
+        "description": "**Demonstrates:** the reverse direction.\n\nOdoo's automation rule fires on `qty_available` change. SoT filter says `should_propagate=true`. The Apply node PUTs to WC `/wp-json/wc/v3/products?sku=ACME-LAPTOP-15`.\n\n**Expected:** `{ status: 'ok', applied: true }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Applied (stock from Odoo SoT)', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.applied).to.be.true;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Idempotency replay — same delivery_id",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-wc-webhook-topic", "value": "order.created" },
+          { "key": "x-wc-webhook-delivery-id", "value": "WC_TEST_001" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 12345,\n  \"line_items\": [{ \"sku\": \"ACME-LAPTOP-15\", \"quantity\": 1 }]\n}"
+        },
+        "url": { "raw": "{{base_url}}{{wc_path}}", "host": ["{{base_url}}{{wc_path}}"] },
+        "description": "**Demonstrates:** idempotency.\n\nReplays request 1 with the same `x-wc-webhook-delivery-id` header. Without dedup we'd decrement Odoo stock twice for the same order.\n\nThe `Idempotency: WC Event` Postgres node returns 0 rows (UNIQUE constraint on `(source_system, source_event_id)` fires `ON CONFLICT DO NOTHING`). The `IF: New?` node routes to `Respond 200 (dup)`. No further nodes execute.\n\n**Expected:** `{ status: 'already_processed' }` and no new sync_audit rows."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Marked already_processed', () => {",
+              "    pm.expect(body.status).to.equal('already_processed');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Circuit OPEN — event gets queued (HTTP 202)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "x-wc-webhook-topic", "value": "order.created" },
+          { "key": "x-wc-webhook-delivery-id", "value": "WC_TEST_006" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": 12399,\n  \"line_items\": [{ \"sku\": \"ACME-LAPTOP-15\", \"quantity\": 1 }]\n}"
+        },
+        "url": { "raw": "{{base_url}}{{wc_path}}", "host": ["{{base_url}}{{wc_path}}"] },
+        "description": "**Demonstrates:** circuit breaker queueing.\n\n**Pre-requisite:** flip Odoo's circuit to OPEN before running:\n\n```sql\nUPDATE system_health SET state='OPEN', consecutive_failures=5, opened_at=NOW()\nWHERE system_name='odoo';\n```\n\nThe Circuit Check node returns `state='OPEN'`. The IF routes to `Queue (Circuit OPEN)` which inserts into `sync_queue`. Response is HTTP 202 instead of 200 to make it explicit that the event is acknowledged but not yet applied.\n\nA drainer cron (mentioned as extension in the workflow README) will sweep `sync_queue` once Odoo recovers.\n\n**Expected:** HTTP 202 with `{ status: 'queued', reason: 'target_circuit_open' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 202 or 200 (depending on circuit state)', () => {",
+              "    pm.expect([200, 202]).to.include(pm.response.code);",
+              "});",
+              "const body = pm.response.json();",
+              "pm.test('If 202, body indicates queued', () => {",
+              "    if (pm.response.code === 202) {",
+              "        pm.expect(body.status).to.equal('queued');",
+              "        pm.expect(body.reason).to.equal('target_circuit_open');",
+              "    } else {",
+              "        // circuit was CLOSED — request applied normally",
+              "        pm.expect(body.status).to.equal('ok');",
+              "    }",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url",  "value": "https://your-n8n.example.com",   "type": "string" },
+    { "key": "wc_path",   "value": "/webhook/sync-from-woo",          "type": "string" },
+    { "key": "odoo_path", "value": "/webhook/sync-from-odoo",         "type": "string" }
+  ]
+}

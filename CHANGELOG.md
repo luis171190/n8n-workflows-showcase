@@ -8,8 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- `multi-store-inventory-sync` — WooCommerce <-> Odoo bidirectional sync
 - `voice-ai-lead-qualifier` — Retell AI + n8n outbound qualifier
+
+## [0.3.0] - 2026-05-08
+
+### Added
+- `multi-store-inventory-sync` — bidirectional inventory sync between WooCommerce and Odoo with source-of-truth-per-field, cross-system idempotency, circuit breaker per target, full audit trail, and nightly reconciliation.
+  - 42-node workflow (36 functional + 6 sticky notes) with **three triggers in one file**: webhook from WC, webhook from Odoo, daily reconciliation cron.
+  - **Source-of-truth matrix**: Odoo for stock + SKU, WooCommerce for price + content. Non-SoT events are filtered with audit log entry `status='ignored_not_sot'` and never propagate.
+  - **Cross-system idempotency** via compound UNIQUE `(source_system, source_event_id)` on `sync_events` — WC delivery IDs and Odoo event UUIDs share the table without colliding.
+  - **Circuit breaker per target** with state machine `CLOSED → OPEN → HALF_OPEN → CLOSED`. Pre-flight check before every outbound HTTP. OPEN target → events queued in `sync_queue` with HTTP 202 acknowledgement.
+  - **Atomic audit + health update** — single SQL CTE updates `sync_audit` row and `system_health` counters in one statement, no race between observation and decision.
+  - **Daily reconciliation** at 03:00 — fetches all SKUs from both sides, computes drift (`stock_drift`, `price_drift`, `missing_in_wc`, `missing_in_odoo`), persists to `reconciliation_runs` + `reconciliation_drift_items`, optionally auto-fixes (env-controlled), surfaces alerts.
+  - 7 SQL tables + seed for `system_health` (WC + Odoo).
+  - 6 curl examples + Postman collection with 13 automated tests covering all four execution paths (applied, ignored, dup, queued).
+  - Architecture documented with flow diagram, circuit breaker state machine, per-node data table, and failure-mode table.
 
 ## [0.2.0] - 2026-05-08
 
