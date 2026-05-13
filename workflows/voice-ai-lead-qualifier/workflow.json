@@ -1,0 +1,770 @@
+{
+  "name": "ACME Solutions — Voice AI Lead Qualifier",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 📞 ACME Solutions — Voice AI Lead Qualifier\n\nThree triggers, asynchronous voice flow:\n\n1. **Lead webhook** (`/webhook/new-lead`) — incoming form submission triggers a Retell call (or queues it).\n2. **Retell post-call webhook** (`/webhook/retell-post-call`) — fires when the call ends; analyzes transcript with LLM and routes the lead.\n3. **Drainer cron** (every 5 min) — sweeps queued calls (out-of-hours, rate-limit hit) and dispatches them.\n\nEnv vars:\n- `RETELL_API_URL`, `RETELL_API_KEY`, `RETELL_AGENT_ID`, `RETELL_FROM_NUMBER`\n- `LLM_PROVIDER` (openai | anthropic) + corresponding API keys\n- `BUSINESS_TIMEZONE`, `WORKING_HOURS_START`, `WORKING_HOURS_END`\n- `GOOGLE_CALENDAR_ID`, Airtable creds\n- Postgres credential `lead_qualifier_db`",
+        "height": 360,
+        "width": 460,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, -200],
+      "typeVersion": 1,
+      "id": "sticky-overview",
+      "name": "Overview"
+    },
+    {
+      "parameters": {
+        "content": "## ⏱️ Async voice flow\n\nA voice call takes 2-7 minutes — too long for a single HTTP request to wait on. Pattern used:\n\n```\n  POST /new-lead  → respond 200 immediately, trigger Retell async\n                    └─ Retell runs the call in their infra\n                       └─ on hangup → POST /retell-post-call\n                                        └─ workflow B handles transcript\n```\n\nThis is a classic **request-response with callback**. The first webhook returns fast (no blocking on the call). The second webhook resumes processing once the call finishes. The lead's row in Postgres is the join key between the two events (matched by `lead_id` we pass to Retell as metadata).",
+        "height": 320,
+        "width": 420,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [580, 380],
+      "typeVersion": 1,
+      "id": "sticky-async",
+      "name": "Note: Async Voice Flow"
+    },
+    {
+      "parameters": {
+        "content": "## 🎙️ Retell prompt engineering\n\nThe Retell agent is configured **outside** this workflow (in the Retell dashboard) with a system prompt designed for BANT discovery without sounding robotic. Full prompt example in the README.\n\n**Key elements of the prompt:**\n- Persona (\"Sarah\", role, context).\n- Conversational style (active listening, empathy markers, max 1 question per turn).\n- BANT goals listed but not as a checklist — flow naturally.\n- Hard time-cap (5 min).\n- End-call tool with reason codes.\n\nThe agent's `agent_id` lives in `RETELL_AGENT_ID` env var. Swapping prompt = updating the agent in Retell, no workflow change.",
+        "height": 360,
+        "width": 420,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [580, 900],
+      "typeVersion": 1,
+      "id": "sticky-prompt",
+      "name": "Note: Retell Prompt"
+    },
+    {
+      "parameters": {
+        "content": "## 🧠 Transcript analysis (structured output)\n\nPost-call, the LLM receives the full transcript + Retell's metadata and must return EXCLUSIVELY:\n\n```json\n{\n  \"bant\": {\n    \"budget\":    { \"value\": \"...\", \"score\": 0-25 },\n    \"authority\": { \"value\": \"...\", \"score\": 0-25 },\n    \"need\":      { \"value\": \"...\", \"score\": 0-25 },\n    \"timeline\":  { \"value\": \"...\", \"score\": 0-25 }\n  },\n  \"score\": 0-100,\n  \"intent\": \"hot\" | \"warm\" | \"cold\" | \"disqualified\",\n  \"objections\": [...],\n  \"summary\": \"<2-line summary>\",\n  \"next_action\": \"schedule_meeting\" | \"nurture\" | \"disqualify\"\n}\n```\n\nWhitelist-validated. If parsing fails, fall back to `intent='warm'` and `next_action='nurture'` — never auto-schedule a meeting on a parse error.",
+        "height": 380,
+        "width": 460,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [1660, 900],
+      "typeVersion": 1,
+      "id": "sticky-bant",
+      "name": "Note: BANT Structured Output"
+    },
+    {
+      "parameters": {
+        "content": "## 🔁 Deduplication\n\n- **At intake**: `leads` table has UNIQUE on `email`. If the same lead form is submitted twice (slow connection, refresh), the second `INSERT … ON CONFLICT DO NOTHING` returns 0 rows → respond 200 silently. No second call placed.\n- **At post-call**: `processed_calls (call_id)` UNIQUE prevents Retell from triggering analysis twice if it retries the post-call webhook.\n\nBoth dedup tables expire after 90 days via a sweeper cron.",
+        "height": 280,
+        "width": 380,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 380],
+      "typeVersion": 1,
+      "id": "sticky-dedup",
+      "name": "Note: Deduplication"
+    },
+    {
+      "parameters": {
+        "content": "## 🚦 Rate limiting / queueing\n\nRetell limits concurrent calls per account (default ~10). If we trigger a call while at the cap, Retell returns 429.\n\nPattern:\n1. Trigger node has `continueOnFail`. If 429 → catch, INSERT into `call_queue` with `scheduled_at = NOW() + INTERVAL '5 minutes'`.\n2. Drainer cron (every 5 min) selects queued items, retries them in small batches.\n\nThe drainer also handles out-of-hours leads: queued with `scheduled_at = next working-hour start in lead's TZ`.",
+        "height": 320,
+        "width": 380,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 720],
+      "typeVersion": 1,
+      "id": "sticky-rate-limit",
+      "name": "Note: Rate Limiting"
+    },
+    {
+      "parameters": {
+        "content": "## ⚖️ Compliance: working hours + DNC\n\nTwo gates before placing a call:\n\n1. **DNC list** — `dnc_list (phone, reason)` PK. Hard block. Mark lead disqualified, no call.\n2. **Working hours** — TZ-aware. The lead's `timezone` field comes from the form (geolocation or explicit). Compute current hour in lead's TZ; if outside `WORKING_HOURS_START..WORKING_HOURS_END`, queue for next morning.\n\nThis prevents both legal issues (TCPA, GDPR-style consent) and bad UX (calling at midnight). Required by basically every jurisdiction.",
+        "height": 320,
+        "width": 420,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [-460, 1080],
+      "typeVersion": 1,
+      "id": "sticky-compliance",
+      "name": "Note: Compliance"
+    },
+    {
+      "parameters": {
+        "content": "## 💰 Cost tracking + fallback retries\n\n**Cost tracking:** post-call insert into `call_costs` with `(call_id, duration_min, retell_cost, llm_input_tokens, llm_output_tokens, llm_cost, total_cost)`. Retell exposes duration + cost in the post-call payload; we add the LLM cost we paid for transcript analysis.\n\n**Fallback retries:** if the call ends with `disconnection_reason='no_answer'` or `'voicemail'`, the post-call webhook handler enqueues a retry in `call_queue` with exponential backoff (15min → 1h → 4h). After 3 attempts → mark `intent='unreachable'`.",
+        "height": 320,
+        "width": 460,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [1660, 480],
+      "typeVersion": 1,
+      "id": "sticky-cost-fallback",
+      "name": "Note: Cost + Retries"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "new-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 200],
+      "id": "lead-webhook",
+      "name": "Webhook: New Lead",
+      "webhookId": "new-lead-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate + enrich incoming lead.\n// Expected body: { email, phone, full_name, company?, timezone?, ... }\nconst body = JSON.parse(JSON.stringify(($input.item.json.body || $input.item.json)));\n\nconst email = String(body.email || '').trim().toLowerCase();\nconst phone = String(body.phone || '').trim();\nconst full_name = String(body.full_name || body.name || '').trim();\n\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email);\nconst phoneValid = /^\\+?[1-9]\\d{6,14}$/.test(phone.replace(/[\\s()-]/g, ''));\n\nif (!emailValid) throw new Error('INVALID_LEAD: bad email');\nif (!phoneValid) throw new Error('INVALID_LEAD: bad phone');\n\n// Naive enrichment: derive company from email domain (skip free providers).\nconst FREE = new Set(['gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','proton.me','aol.com']);\nconst domain = email.split('@')[1];\nconst derived_company = (!FREE.has(domain) && domain.split('.')[0]) || null;\nconst company = body.company || (derived_company ? derived_company.charAt(0).toUpperCase() + derived_company.slice(1) : 'Unknown');\n\n// Timezone: trust the form if provided; else fallback to business TZ.\nconst lead_timezone = body.timezone || $env.BUSINESS_TIMEZONE || 'America/New_York';\n\nreturn [{ json: {\n  email,\n  phone: phone.replace(/[\\s()-]/g, ''),\n  full_name,\n  company,\n  lead_timezone,\n  raw_payload: body,\n  received_at: new Date().toISOString()\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-20, 200],
+      "id": "lead-validate",
+      "name": "Validate + Enrich"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads (email, phone, full_name, company, lead_timezone, raw_payload, received_at, status) VALUES ($1, $2, $3, $4, $5, $6::JSONB, $7::TIMESTAMPTZ, 'NEW') ON CONFLICT (email) DO NOTHING RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.email }},{{ $json.phone }},{{ $json.full_name }},{{ $json.company }},{{ $json.lead_timezone }},{{ JSON.stringify($json.raw_payload) }},{{ $json.received_at }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [160, 200],
+      "id": "lead-idempotency",
+      "name": "Idempotency: Lead",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [340, 200],
+      "id": "lead-if-new",
+      "name": "Lead: New?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"already_received\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [520, 60],
+      "id": "lead-respond-dup",
+      "name": "Lead: Respond 200 (dup)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT phone, reason, added_at FROM dnc_list WHERE phone = $1 LIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ $('Validate + Enrich').item.json.phone }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [520, 200],
+      "id": "lead-dnc-check",
+      "name": "DNC Check",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.phone }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [700, 200],
+      "id": "lead-if-dnc",
+      "name": "Lead: On DNC?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'DISQUALIFIED', disqualified_reason = 'on_dnc_list', updated_at = NOW() WHERE email = $1 RETURNING id, status;",
+        "options": {
+          "queryReplacement": "={{ $('Validate + Enrich').item.json.email }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [880, 60],
+      "id": "lead-mark-dnc",
+      "name": "Lead: Mark DNC",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"disqualified\", \"reason\": \"on_dnc_list\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1060, 60],
+      "id": "lead-respond-dnc",
+      "name": "Lead: Respond 200 (dnc)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Working-hours compliance check (timezone-aware).\n// Returns: { in_hours: bool, scheduled_at: <ISO if not in hours, else null> }\nconst lead = JSON.parse(JSON.stringify($('Validate + Enrich').item.json));\nconst tz = lead.lead_timezone || $env.BUSINESS_TIMEZONE || 'America/New_York';\nconst hStart = parseInt($env.WORKING_HOURS_START || '9', 10);\nconst hEnd   = parseInt($env.WORKING_HOURS_END   || '18', 10);\n\nconst nowParts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: 'numeric', hour12: false, weekday: 'short' }).formatToParts(new Date());\nconst hourLocal = parseInt(nowParts.find(p => p.type === 'hour').value, 10);\nconst weekday = nowParts.find(p => p.type === 'weekday').value; // Mon, Tue, ...\nconst isWeekend = weekday === 'Sat' || weekday === 'Sun';\n\nconst in_hours = !isWeekend && hourLocal >= hStart && hourLocal < hEnd;\n\nlet scheduled_at = null;\nif (!in_hours) {\n  // Schedule for next working-hour start in lead's TZ.\n  // Simplification: add hours in UTC until the local hour is hStart on a weekday.\n  const d = new Date();\n  for (let i = 0; i < 72; i++) {\n    d.setHours(d.getHours() + 1);\n    const p = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: 'numeric', hour12: false, weekday: 'short' }).formatToParts(d);\n    const h = parseInt(p.find(x => x.type === 'hour').value, 10);\n    const w = p.find(x => x.type === 'weekday').value;\n    if (h === hStart && w !== 'Sat' && w !== 'Sun') { scheduled_at = d.toISOString(); break; }\n  }\n  if (!scheduled_at) { d.setHours(d.getHours() + 24); scheduled_at = d.toISOString(); }\n}\n\nreturn [{ json: { ...lead, in_hours, scheduled_at, hour_local: hourLocal, weekday } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 200],
+      "id": "lead-hours-check",
+      "name": "Compliance: Working Hours"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.in_hours }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1060, 200],
+      "id": "lead-if-in-hours",
+      "name": "Lead: In Hours?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO call_queue (lead_id, phone, scheduled_at, reason, retry_count, status) SELECT id, $2, $3::TIMESTAMPTZ, 'out_of_hours', 0, 'WAITING' FROM leads WHERE email = $1 RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Validate + Enrich').item.json.email }},{{ $('Validate + Enrich').item.json.phone }},{{ $json.scheduled_at }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1240, 320],
+      "id": "lead-queue-out-of-hours",
+      "name": "Queue (out of hours)",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"queued\", \"reason\": \"out_of_hours\", \"scheduled_at\": {{ JSON.stringify($('Compliance: Working Hours').item.json.scheduled_at) }} }",
+        "options": { "responseCode": 202 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1420, 320],
+      "id": "lead-respond-queued",
+      "name": "Lead: Respond 202 (queued)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RETELL_API_URL || 'https://api.retellai.com' }}/v1/create-phone-call",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.RETELL_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"from_number\": {{ JSON.stringify($env.RETELL_FROM_NUMBER) }},\n  \"to_number\":   {{ JSON.stringify($('Validate + Enrich').item.json.phone) }},\n  \"override_agent_id\": {{ JSON.stringify($env.RETELL_AGENT_ID) }},\n  \"metadata\": {\n    \"lead_email\":    {{ JSON.stringify($('Validate + Enrich').item.json.email) }},\n    \"lead_company\":  {{ JSON.stringify($('Validate + Enrich').item.json.company) }},\n    \"lead_full_name\":{{ JSON.stringify($('Validate + Enrich').item.json.full_name) }}\n  }\n}",
+        "options": { "timeout": 10000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 200],
+      "id": "lead-trigger-retell",
+      "name": "Trigger Retell Call",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH attempt AS (INSERT INTO call_attempts (lead_id, retell_call_id, status, started_at, attempt_number) SELECT id, $2, CASE WHEN $3::BOOLEAN THEN 'INITIATED' ELSE 'FAILED_TO_INITIATE' END, NOW(), COALESCE((SELECT MAX(attempt_number) FROM call_attempts WHERE lead_id = leads.id), 0) + 1 FROM leads WHERE email = $1 RETURNING id, lead_id, status) UPDATE leads SET status = CASE WHEN $3::BOOLEAN THEN 'CALL_IN_PROGRESS' ELSE 'CALL_FAILED' END, updated_at = NOW() WHERE id = (SELECT lead_id FROM attempt) RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Validate + Enrich').item.json.email }},{{ ($json.call_id || $json.id || '') }},{{ !$json.error }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 200],
+      "id": "lead-persist-attempt",
+      "name": "Persist Call Attempt",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"call_triggered\", \"retell_call_id\": {{ JSON.stringify($('Trigger Retell Call').item.json.call_id || $('Trigger Retell Call').item.json.id || null) }} }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1600, 200],
+      "id": "lead-respond-triggered",
+      "name": "Lead: Respond 200 (triggered)"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "retell-post-call",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-200, 760],
+      "id": "post-call-webhook",
+      "name": "Webhook: Retell Post-Call",
+      "webhookId": "retell-post-call-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_calls (call_id, raw_payload, processed_at) VALUES ($1, $2::JSONB, NOW()) ON CONFLICT (call_id) DO NOTHING RETURNING call_id;",
+        "options": {
+          "queryReplacement": "={{ $json.body && $json.body.call_id || $json.body && $json.body.call && $json.body.call.call_id || ('call_' + Date.now()) }},{{ JSON.stringify($json.body || $json) }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-20, 760],
+      "id": "post-call-idempotency",
+      "name": "Idempotency: Call",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.call_id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [160, 760],
+      "id": "post-call-if-new",
+      "name": "Call: New?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"already_processed\" }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [340, 620],
+      "id": "post-call-respond-dup",
+      "name": "Call: Respond 200 (dup)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Retell post-call payload.\n// Retell posts: { call_id, transcript, transcript_object, metadata, duration_ms,\n//                 disconnection_reason, call_cost, recording_url, ... }\nconst raw = JSON.parse(JSON.stringify($('Webhook: Retell Post-Call').item.json));\nconst body = raw.body || raw;\nconst call = body.call || body;\n\nconst lead_email = call.metadata && call.metadata.lead_email;\nconst transcript = call.transcript || (call.transcript_object && call.transcript_object.map(t => `${t.role}: ${t.content}`).join('\\n')) || '';\nconst duration_min = ((call.duration_ms || 0) / 60000).toFixed(2);\nconst disconnection_reason = call.disconnection_reason || 'unknown';\nconst retell_cost = (call.call_cost && call.call_cost.combined_cost) || 0;\n\nreturn [{ json: {\n  call_id: call.call_id,\n  lead_email,\n  transcript,\n  duration_min,\n  disconnection_reason,\n  retell_cost,\n  recording_url: call.recording_url || null,\n  metadata: call.metadata || {},\n  raw_call: call\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 760],
+      "id": "post-call-parse",
+      "name": "Parse Retell Payload"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $env.LLM_PROVIDER || 'openai' }}", "rightValue": "openai", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "openai"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $env.LLM_PROVIDER || 'openai' }}", "rightValue": "anthropic", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "anthropic"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [520, 760],
+      "id": "post-call-switch-llm",
+      "name": "Switch: LLM Provider"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.OPENAI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"You are a sales analyst. Read the transcript of a discovery call and extract a BANT-style qualification. Return EXCLUSIVELY a JSON object with shape: { \\\"bant\\\": { \\\"budget\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"authority\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"need\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"timeline\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 } }, \\\"score\\\": 0-100, \\\"intent\\\": \\\"hot\\\"|\\\"warm\\\"|\\\"cold\\\"|\\\"disqualified\\\", \\\"objections\\\": string[], \\\"summary\\\": string, \\\"next_action\\\": \\\"schedule_meeting\\\"|\\\"nurture\\\"|\\\"disqualify\\\" }. Score totals MUST equal sum of BANT scores. intent and next_action must be consistent (hot→schedule_meeting, warm→nurture, cold|disqualified→disqualify).\" },\n    { \"role\": \"user\", \"content\": {{ JSON.stringify('Transcript of the call:\\n\\n' + $json.transcript + '\\n\\nDuration (min): ' + $json.duration_min + '\\nDisconnection reason: ' + $json.disconnection_reason) }} }\n  ]\n}",
+        "options": { "timeout": 30000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 640],
+      "id": "post-call-openai",
+      "name": "OpenAI: Analyze Transcript"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-5\",\n  \"max_tokens\": 1500,\n  \"system\": \"You are a sales analyst. Read the transcript of a discovery call and extract a BANT-style qualification. Return EXCLUSIVELY a JSON object with shape: { \\\"bant\\\": { \\\"budget\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"authority\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"need\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 }, \\\"timeline\\\": { \\\"value\\\": string, \\\"score\\\": 0-25 } }, \\\"score\\\": 0-100, \\\"intent\\\": \\\"hot\\\"|\\\"warm\\\"|\\\"cold\\\"|\\\"disqualified\\\", \\\"objections\\\": string[], \\\"summary\\\": string, \\\"next_action\\\": \\\"schedule_meeting\\\"|\\\"nurture\\\"|\\\"disqualify\\\" }. Score totals MUST equal sum of BANT scores. intent and next_action must be consistent (hot→schedule_meeting, warm→nurture, cold|disqualified→disqualify).\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": {{ JSON.stringify('Transcript of the call:\\n\\n' + $json.transcript + '\\n\\nDuration (min): ' + $json.duration_min + '\\nDisconnection reason: ' + $json.disconnection_reason) }} }\n  ]\n}",
+        "options": { "timeout": 30000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 880],
+      "id": "post-call-anthropic",
+      "name": "Anthropic: Analyze Transcript"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize LLM output + whitelist-validate. Defaults to safe values on parse error.\nconst parsed_call = JSON.parse(JSON.stringify($('Parse Retell Payload').item.json));\nconst raw = JSON.parse(JSON.stringify($input.item.json));\nconst provider = $env.LLM_PROVIDER || 'openai';\n\nconst ALLOWED_INTENTS = ['hot','warm','cold','disqualified'];\nconst ALLOWED_ACTIONS = ['schedule_meeting','nurture','disqualify'];\n\nlet content = '', parsed = null, parse_error = null;\nlet input_tokens = 0, output_tokens = 0;\ntry {\n  if (provider === 'openai') {\n    content = raw.choices && raw.choices[0] && raw.choices[0].message ? raw.choices[0].message.content : '';\n    input_tokens  = raw.usage && raw.usage.prompt_tokens || 0;\n    output_tokens = raw.usage && raw.usage.completion_tokens || 0;\n  } else if (provider === 'anthropic') {\n    content = raw.content && raw.content[0] && raw.content[0].text ? raw.content[0].text : '';\n    input_tokens  = raw.usage && raw.usage.input_tokens || 0;\n    output_tokens = raw.usage && raw.usage.output_tokens || 0;\n  }\n  const m = content.match(/\\{[\\s\\S]*\\}/);\n  if (m) parsed = JSON.parse(m[0]);\n} catch (e) { parse_error = e.message; }\n\n// Safe defaults — never auto-schedule on parse error.\nconst SAFE = { bant: { budget: {value: '', score: 0}, authority: {value: '', score: 0}, need: {value: '', score: 0}, timeline: {value: '', score: 0} }, score: 0, intent: 'warm', objections: [], summary: 'Auto-fallback: LLM parse error', next_action: 'nurture' };\nconst result = parsed || SAFE;\nresult.intent      = ALLOWED_INTENTS.includes(result.intent)      ? result.intent      : 'warm';\nresult.next_action = ALLOWED_ACTIONS.includes(result.next_action) ? result.next_action : 'nurture';\n\n// Reconcile intent ↔ next_action.\nif (result.intent === 'hot' && result.next_action !== 'schedule_meeting') result.next_action = 'schedule_meeting';\nif (result.intent === 'cold' || result.intent === 'disqualified') result.next_action = 'disqualify';\n\n// Compute LLM cost (very rough — adjust for real prices).\nconst PRICES = { 'openai': { in: 0.00015 / 1000, out: 0.0006 / 1000 }, 'anthropic': { in: 0.003 / 1000, out: 0.015 / 1000 } };\nconst px = PRICES[provider] || PRICES.openai;\nconst llm_cost = (input_tokens * px.in) + (output_tokens * px.out);\n\nreturn [{ json: { ...parsed_call, llm_provider: provider, llm_input_tokens: input_tokens, llm_output_tokens: output_tokens, llm_cost: Number(llm_cost.toFixed(5)), bant_result: result, parse_error } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 760],
+      "id": "post-call-normalize",
+      "name": "Normalize + BANT Extract"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH lead_update AS (UPDATE leads SET status = CASE $2 WHEN 'hot' THEN 'QUALIFIED_HOT' WHEN 'warm' THEN 'QUALIFIED_WARM' WHEN 'cold' THEN 'QUALIFIED_COLD' WHEN 'disqualified' THEN 'DISQUALIFIED' ELSE status END, bant_score = $3::INT, bant_summary = $4, last_call_at = NOW(), updated_at = NOW() WHERE email = $1 RETURNING id) INSERT INTO call_costs (call_id, lead_id, duration_min, retell_cost, llm_provider, llm_input_tokens, llm_output_tokens, llm_cost, total_cost, created_at) SELECT $5, (SELECT id FROM lead_update), $6, $7, $8, $9, $10, $11, $7 + $11, NOW() RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.lead_email }},{{ $json.bant_result.intent }},{{ $json.bant_result.score }},{{ JSON.stringify($json.bant_result.summary) }},{{ $json.call_id }},{{ $json.duration_min }},{{ $json.retell_cost }},{{ $json.llm_provider }},{{ $json.llm_input_tokens }},{{ $json.llm_output_tokens }},{{ $json.llm_cost }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1060, 760],
+      "id": "post-call-update-lead",
+      "name": "Update Lead + Insert Cost",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $('Normalize + BANT Extract').item.json.bant_result.next_action }}", "rightValue": "schedule_meeting", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "schedule"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+                "combinator": "and",
+                "conditions": [
+                  { "leftValue": "={{ $('Normalize + BANT Extract').item.json.bant_result.next_action }}", "rightValue": "nurture", "operator": { "type": "string", "operation": "equals" } }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "nurture"
+            }
+          ],
+          "options": { "fallbackOutput": "extra" }
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1240, 760],
+      "id": "post-call-route",
+      "name": "Route by Intent"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://www.googleapis.com/calendar/v3/calendars/{{ encodeURIComponent($env.GOOGLE_CALENDAR_ID || 'primary') }}/events",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCalendarOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"summary\":     {{ JSON.stringify('Discovery call follow-up: ' + ($('Normalize + BANT Extract').item.json.metadata.lead_full_name || $('Normalize + BANT Extract').item.json.lead_email)) }},\n  \"description\": {{ JSON.stringify('Auto-scheduled by ACME Solutions Voice AI Qualifier.\\n\\nBANT score: ' + $('Normalize + BANT Extract').item.json.bant_result.score + '/100\\nIntent: ' + $('Normalize + BANT Extract').item.json.bant_result.intent + '\\nSummary: ' + $('Normalize + BANT Extract').item.json.bant_result.summary + '\\n\\nLead email: ' + $('Normalize + BANT Extract').item.json.lead_email) }},\n  \"start\": { \"dateTime\": {{ JSON.stringify(new Date(Date.now() + 24*60*60*1000).toISOString()) }}, \"timeZone\": \"UTC\" },\n  \"end\":   { \"dateTime\": {{ JSON.stringify(new Date(Date.now() + 24*60*60*1000 + 30*60*1000).toISOString()) }}, \"timeZone\": \"UTC\" },\n  \"attendees\": [{ \"email\": {{ JSON.stringify($('Normalize + BANT Extract').item.json.lead_email) }} }]\n}",
+        "options": { "timeout": 8000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 640],
+      "id": "post-call-schedule-cal",
+      "name": "GCal: Schedule Meeting",
+      "credentials": {
+        "googleCalendarOAuth2Api": { "id": "REPLACE_WITH_GCAL_OAUTH_CRED_ID", "name": "google_calendar_oauth" }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.airtable.com/v0/{{ $env.AIRTABLE_BASE_ID }}/{{ encodeURIComponent($env.AIRTABLE_TABLE_DEALS || 'Deals') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.AIRTABLE_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"fields\": {\n    \"Lead Email\":   {{ JSON.stringify($('Normalize + BANT Extract').item.json.lead_email) }},\n    \"Company\":      {{ JSON.stringify($('Normalize + BANT Extract').item.json.metadata.lead_company || '') }},\n    \"BANT Score\":   {{ Number($('Normalize + BANT Extract').item.json.bant_result.score) }},\n    \"Intent\":       {{ JSON.stringify($('Normalize + BANT Extract').item.json.bant_result.intent) }},\n    \"Summary\":      {{ JSON.stringify($('Normalize + BANT Extract').item.json.bant_result.summary) }},\n    \"Source\":       \"Voice AI Qualifier\",\n    \"Stage\":        \"Discovery completed\"\n  }\n}",
+        "options": { "timeout": 8000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1600, 640],
+      "id": "post-call-airtable",
+      "name": "Airtable: Create Deal",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO nurture_queue (lead_id, sequence, scheduled_at, status) SELECT id, 'default_b2b', NOW(), 'PENDING' FROM leads WHERE email = $1 ON CONFLICT (lead_id) DO UPDATE SET sequence = EXCLUDED.sequence, scheduled_at = EXCLUDED.scheduled_at, status = 'PENDING' RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Normalize + BANT Extract').item.json.lead_email }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 760],
+      "id": "post-call-nurture",
+      "name": "Insert Nurture Queue",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"call_id\": {{ JSON.stringify($('Normalize + BANT Extract').item.json.call_id) }}, \"intent\": {{ JSON.stringify($('Normalize + BANT Extract').item.json.bant_result.intent) }}, \"score\": {{ Number($('Normalize + BANT Extract').item.json.bant_result.score) }}, \"next_action\": {{ JSON.stringify($('Normalize + BANT Extract').item.json.bant_result.next_action) }} }",
+        "options": { "responseCode": 200 }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1800, 760],
+      "id": "post-call-respond",
+      "name": "Post-Call: Respond 200"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "minutes", "minutesInterval": 5 }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-200, 1340],
+      "id": "drainer-cron",
+      "name": "Cron: Every 5 min"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT cq.id AS queue_id, cq.lead_id, cq.phone, cq.retry_count, l.email, l.full_name, l.company FROM call_queue cq JOIN leads l ON l.id = cq.lead_id WHERE cq.status = 'WAITING' AND cq.scheduled_at <= NOW() ORDER BY cq.scheduled_at LIMIT 10;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-20, 1340],
+      "id": "drainer-fetch",
+      "name": "Drainer: Fetch Queue",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RETELL_API_URL || 'https://api.retellai.com' }}/v1/create-phone-call",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.RETELL_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"from_number\": {{ JSON.stringify($env.RETELL_FROM_NUMBER) }},\n  \"to_number\":   {{ JSON.stringify($json.phone) }},\n  \"override_agent_id\": {{ JSON.stringify($env.RETELL_AGENT_ID) }},\n  \"metadata\": {\n    \"lead_email\":     {{ JSON.stringify($json.email) }},\n    \"lead_company\":   {{ JSON.stringify($json.company) }},\n    \"lead_full_name\": {{ JSON.stringify($json.full_name) }},\n    \"queue_retry\":    true\n  }\n}",
+        "options": { "timeout": 10000 }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [160, 1340],
+      "id": "drainer-trigger",
+      "name": "Drainer: Trigger Retell",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE call_queue SET status = CASE WHEN $2::BOOLEAN THEN 'DISPATCHED' WHEN retry_count >= 3 THEN 'GAVE_UP' ELSE 'RETRY' END, retry_count = retry_count + 1, last_attempt_at = NOW(), scheduled_at = CASE WHEN NOT $2::BOOLEAN AND retry_count < 3 THEN NOW() + (POWER(2, retry_count + 1) * INTERVAL '15 minutes') ELSE scheduled_at END, last_error = $3 WHERE id = $1::UUID RETURNING id, status, retry_count;",
+        "options": {
+          "queryReplacement": "={{ $('Drainer: Fetch Queue').item.json.queue_id }},{{ !$json.error }},{{ ($json.error && $json.error.message) || '' }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [340, 1340],
+      "id": "drainer-update",
+      "name": "Drainer: Update Queue Status",
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_LEAD_DB_CRED_ID", "name": "lead_qualifier_db" }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: New Lead":           { "main": [[{ "node": "Validate + Enrich",            "type": "main", "index": 0 }]] },
+    "Validate + Enrich":           { "main": [[{ "node": "Idempotency: Lead",            "type": "main", "index": 0 }]] },
+    "Idempotency: Lead":           { "main": [[{ "node": "Lead: New?",                   "type": "main", "index": 0 }]] },
+    "Lead: New?":                  { "main": [
+                                       [{ "node": "DNC Check",                           "type": "main", "index": 0 }],
+                                       [{ "node": "Lead: Respond 200 (dup)",             "type": "main", "index": 0 }]
+                                     ] },
+    "DNC Check":                   { "main": [[{ "node": "Lead: On DNC?",                "type": "main", "index": 0 }]] },
+    "Lead: On DNC?":               { "main": [
+                                       [{ "node": "Lead: Mark DNC",                      "type": "main", "index": 0 }],
+                                       [{ "node": "Compliance: Working Hours",           "type": "main", "index": 0 }]
+                                     ] },
+    "Lead: Mark DNC":              { "main": [[{ "node": "Lead: Respond 200 (dnc)",      "type": "main", "index": 0 }]] },
+    "Compliance: Working Hours":   { "main": [[{ "node": "Lead: In Hours?",              "type": "main", "index": 0 }]] },
+    "Lead: In Hours?":             { "main": [
+                                       [{ "node": "Trigger Retell Call",                 "type": "main", "index": 0 }],
+                                       [{ "node": "Queue (out of hours)",                "type": "main", "index": 0 }]
+                                     ] },
+    "Queue (out of hours)":        { "main": [[{ "node": "Lead: Respond 202 (queued)",   "type": "main", "index": 0 }]] },
+    "Trigger Retell Call":         { "main": [[{ "node": "Persist Call Attempt",         "type": "main", "index": 0 }]] },
+    "Persist Call Attempt":        { "main": [[{ "node": "Lead: Respond 200 (triggered)","type": "main", "index": 0 }]] },
+
+    "Webhook: Retell Post-Call":   { "main": [[{ "node": "Idempotency: Call",            "type": "main", "index": 0 }]] },
+    "Idempotency: Call":           { "main": [[{ "node": "Call: New?",                   "type": "main", "index": 0 }]] },
+    "Call: New?":                  { "main": [
+                                       [{ "node": "Parse Retell Payload",                "type": "main", "index": 0 }],
+                                       [{ "node": "Call: Respond 200 (dup)",             "type": "main", "index": 0 }]
+                                     ] },
+    "Parse Retell Payload":        { "main": [[{ "node": "Switch: LLM Provider",         "type": "main", "index": 0 }]] },
+    "Switch: LLM Provider":        { "main": [
+                                       [{ "node": "OpenAI: Analyze Transcript",          "type": "main", "index": 0 }],
+                                       [{ "node": "Anthropic: Analyze Transcript",       "type": "main", "index": 0 }]
+                                     ] },
+    "OpenAI: Analyze Transcript":  { "main": [[{ "node": "Normalize + BANT Extract",     "type": "main", "index": 0 }]] },
+    "Anthropic: Analyze Transcript":{ "main": [[{ "node": "Normalize + BANT Extract",    "type": "main", "index": 0 }]] },
+    "Normalize + BANT Extract":    { "main": [[{ "node": "Update Lead + Insert Cost",    "type": "main", "index": 0 }]] },
+    "Update Lead + Insert Cost":   { "main": [[{ "node": "Route by Intent",              "type": "main", "index": 0 }]] },
+    "Route by Intent":             { "main": [
+                                       [{ "node": "GCal: Schedule Meeting",              "type": "main", "index": 0 }],
+                                       [{ "node": "Insert Nurture Queue",                "type": "main", "index": 0 }],
+                                       [{ "node": "Post-Call: Respond 200",              "type": "main", "index": 0 }]
+                                     ] },
+    "GCal: Schedule Meeting":      { "main": [[{ "node": "Airtable: Create Deal",        "type": "main", "index": 0 }]] },
+    "Airtable: Create Deal":       { "main": [[{ "node": "Post-Call: Respond 200",       "type": "main", "index": 0 }]] },
+    "Insert Nurture Queue":        { "main": [[{ "node": "Post-Call: Respond 200",       "type": "main", "index": 0 }]] },
+
+    "Cron: Every 5 min":           { "main": [[{ "node": "Drainer: Fetch Queue",         "type": "main", "index": 0 }]] },
+    "Drainer: Fetch Queue":        { "main": [[{ "node": "Drainer: Trigger Retell",      "type": "main", "index": 0 }]] },
+    "Drainer: Trigger Retell":     { "main": [[{ "node": "Drainer: Update Queue Status", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "version": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

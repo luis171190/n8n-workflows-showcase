@@ -5,10 +5,27 @@ All notable changes to this repository will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-05-13
 
-### Planned
-- `voice-ai-lead-qualifier` — Retell AI + n8n outbound qualifier
+### Added
+- Initial public release: 4 production-grade n8n workflows covering e-commerce, conversational booking, multi-system inventory sync, and voice AI lead qualification.
+
+## [0.4.0] - 2026-05-13
+
+### Added
+- `voice-ai-lead-qualifier` — Retell AI + n8n outbound qualifier with BANT scoring, dual-LLM analysis, and TZ-aware compliance.
+  - 43-node workflow (35 functional + 8 sticky notes) with **three triggers**: inbound lead webhook, Retell post-call webhook, 5-min drainer cron.
+  - **Async voice flow**: Subflow A triggers Retell and responds in <500ms; Subflow B receives post-call webhook asynchronously — ingestion and analysis are fully decoupled.
+  - **BANT with structured output**: forced JSON schema via OpenAI `response_format` / Anthropic `tool_use`. Score 0-10, intent hot/warm/cold/disqualified, next_action reconciled with deterministic rules (hot → schedule_meeting, cold/disqualified → disqualify).
+  - **Two-layer deduplication**: inbound UNIQUE `email` on `leads`; post-call PRIMARY KEY `retell_call_id` on `processed_calls`. Prevents double-calling the same lead and double-scoring the same call.
+  - **TZ-aware compliance**: `Intl.DateTimeFormat` with IANA timezone, configurable working-hours window, next working-hour slot calculated for out-of-hours leads.
+  - **Exponential backoff in drainer**: `POWER(2, retry_count) * 15 min`, GAVE_UP at 10 retries.
+  - **Safe defaults in BANT extraction**: `try/catch` + fallback object with `intent='warm'` — no silent lead discard on LLM parse error.
+  - **Cost tracking**: `call_costs` table persists Retell call cost + estimated LLM analysis cost per token count.
+  - **Retell system prompt example**: full SDR-persona prompt covering BANT capture order, natural conversation flow, and opt-out handling.
+  - 7 SQL tables + auto-updated_at triggers + seed DNC entry.
+  - 6 curl examples + Postman collection with 6 requests + 12 automated tests covering: happy path, DNC block, out-of-hours queue, hot/warm routing, idempotency replay.
+  - Architecture documented with async voice flow diagram, BANT decision tree, per-node data table, and failure-mode table.
 
 ## [0.3.0] - 2026-05-08
 

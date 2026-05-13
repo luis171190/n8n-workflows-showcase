@@ -1,0 +1,195 @@
+{
+  "info": {
+    "_postman_id": "d3e4f5a6-7b8c-9d0e-1f2a-3b4c5d6e7f8a",
+    "name": "Voice AI Lead Qualifier — n8n + Retell AI",
+    "description": "End-to-end requests for the `voice-ai-lead-qualifier` n8n workflow.\n\nCovers: happy-path call trigger, DNC block, out-of-hours queue, hot/warm/cold post-call routing, and idempotency replay. Each request includes automated tests asserting the response shape and expected DB side-effects.\n\n## Usage\n\n1. Import this file in Postman.\n2. Set environment variables:\n   - `base_url`   — your n8n instance, e.g. `https://your-n8n.example.com`\n   - `lead_path`  — `/webhook/new-lead`\n   - `retell_path` — `/webhook/retell-post-call`\n3. Run requests in order — they share `lead_id` and `call_id` patterns.\n\n## Reset DB between runs\n\n```sql\nTRUNCATE leads, call_attempts, processed_calls, call_queue,\n         call_costs, nurture_queue RESTART IDENTITY CASCADE;\n-- Keep dnc_list seed entry\n```\n\n## Schemas asserted\n\n```ts\n// HTTP 200 — call initiated\n{ status: 'ok', action: 'call_initiated', lead_id: string, call_attempt_id: string }\n\n// HTTP 200 — DNC blocked\n{ status: 'blocked', reason: 'phone_on_dnc' }\n\n// HTTP 202 — out of hours\n{ status: 'queued', reason: 'out_of_hours', scheduled_at: string, queue_id: string }\n\n// HTTP 200 — already queued (duplicate lead)\n{ status: 'already_queued' }\n\n// HTTP 200 — post-call hot\n{ status: 'ok', intent: 'hot', bant_score: number, next_action: 'schedule_meeting' }\n\n// HTTP 200 — post-call warm\n{ status: 'ok', intent: 'warm', next_action: 'nurture' }\n\n// HTTP 200 — already processed (dup post-call)\n{ status: 'already_processed' }\n```",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. New lead — happy path (call initiated)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"jane.doe@acmecorp.com\",\n  \"phone\": \"+15551234567\",\n  \"first_name\": \"Jane\",\n  \"last_name\": \"Doe\",\n  \"company\": \"Acme Corp\",\n  \"source\": \"landing_page\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{lead_path}}", "host": ["{{base_url}}{{lead_path}}"] },
+        "description": "**Demonstrates:** the canonical happy path.\n\n- Email validated, phone converted to E.164.\n- `INSERT leads ON CONFLICT (email) DO NOTHING` returns 1 row → new lead.\n- Phone not in `dnc_list` → passes DNC check.\n- Working hours check passes (assumed in-hours during test run).\n- `POST /v2/create-phone-call` to Retell triggers outbound call.\n- `call_attempts` row inserted.\n\n**Expected:** HTTP 200 `{ status: 'ok', action: 'call_initiated' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Call initiated', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.action).to.equal('call_initiated');",
+              "    pm.expect(body.lead_id).to.be.a('string').and.have.length.greaterThan(8);",
+              "    pm.expect(body.call_attempt_id).to.be.a('string').and.have.length.greaterThan(8);",
+              "});",
+              "pm.environment.set('lead_id', body.lead_id);"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Same lead — duplicate (already queued)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"jane.doe@acmecorp.com\",\n  \"phone\": \"+15551234567\",\n  \"first_name\": \"Jane\",\n  \"source\": \"email_campaign\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{lead_path}}", "host": ["{{base_url}}{{lead_path}}"] },
+        "description": "**Demonstrates:** idempotency on lead email.\n\nSame `email` as request 1. `INSERT leads ON CONFLICT (email) DO NOTHING RETURNING id` returns 0 rows. The `IF: Lead New?` node routes to `Respond 200 (already_queued)`. No second Retell call is placed.\n\n**Expected:** HTTP 200 `{ status: 'already_queued' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Already queued', () => {",
+              "    pm.expect(body.status).to.equal('already_queued');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. DNC lead — blocked",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"blocked@example.com\",\n  \"phone\": \"+15550000000\",\n  \"first_name\": \"Blocked\",\n  \"source\": \"webinar\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{lead_path}}", "host": ["{{base_url}}{{lead_path}}"] },
+        "description": "**Demonstrates:** DNC filter.\n\n`+15550000000` is the seed entry in `dnc_list`. The `DNC Check` Postgres node returns a row, `IF: Lead On DNC?` routes to `Lead: Mark DNC` (UPDATE leads SET status='dnc') and then `Respond 200 (blocked)`. No call attempt is created.\n\n**Expected:** HTTP 200 `{ status: 'blocked', reason: 'phone_on_dnc' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('DNC blocked', () => {",
+              "    pm.expect(body.status).to.equal('blocked');",
+              "    pm.expect(body.reason).to.equal('phone_on_dnc');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Post-call — HOT lead (score 9)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"call_id\": \"retell_call_HOT_TEST_001\",\n  \"from_number\": \"+15551234567\",\n  \"to_number\": \"+15559990001\",\n  \"duration\": 187,\n  \"call_status\": \"ended\",\n  \"cost\": 0.062,\n  \"metadata\": {\n    \"lead_id\": \"{{lead_id}}\"\n  },\n  \"transcript\": \"Agent: Hi, am I speaking with Jane from Acme Corp?\\nJane: Yes, speaking.\\nAgent: Great! I'm calling about our AI automation platform. Are you currently evaluating any solutions?\\nJane: Actually yes, we have budget approved for Q3, around $50k. I'm the VP of Ops so I can sign off. We really need this now, our manual processes are killing us.\\nAgent: That sounds like a great fit. Would you be open to a demo this week?\\nJane: Absolutely, let's do Thursday afternoon.\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{retell_path}}", "host": ["{{base_url}}{{retell_path}}"] },
+        "description": "**Demonstrates:** post-call analysis for a HOT lead.\n\nTranscript contains strong BANT signals: confirmed budget ($50k), authority (VP Ops), strong need (manual processes), immediate timing. LLM should score 8-10 and set intent='hot'.\n\nExpected side-effects:\n- `processed_calls` row inserted (idempotency).\n- `leads` updated: intent='hot', bant_score>=8, status='called'.\n- `call_costs` row inserted.\n- Google Calendar event created.\n- Airtable deal record created.\n\n**Expected:** HTTP 200 `{ status: 'ok', intent: 'hot', bant_score: >=8, next_action: 'schedule_meeting' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('HOT lead routed', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.intent).to.equal('hot');",
+              "    pm.expect(body.bant_score).to.be.a('number').and.be.at.least(7);",
+              "    pm.expect(body.next_action).to.equal('schedule_meeting');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Post-call — WARM lead (score 5, nurture)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"call_id\": \"retell_call_WARM_TEST_001\",\n  \"from_number\": \"+15559876543\",\n  \"to_number\": \"+15559990001\",\n  \"duration\": 142,\n  \"call_status\": \"ended\",\n  \"cost\": 0.047,\n  \"metadata\": {\n    \"lead_id\": \"warm-lead-placeholder-id\"\n  },\n  \"transcript\": \"Agent: Hi Bob, calling from TechCo about our automation platform.\\nBob: Oh hi, yeah I saw your ad. We might be interested but budget is a bit uncertain right now. Maybe in 3-4 months.\\nAgent: Totally understand. What are your main pain points today?\\nBob: We do a lot of manual data entry. It's a problem but the CTO needs to approve any spend.\\nAgent: Got it. Would it be okay if we followed up with some case studies?\\nBob: Sure, that's fine.\"\n}"
+        },
+        "url": { "raw": "{{base_url}}{{retell_path}}", "host": ["{{base_url}}{{retell_path}}"] },
+        "description": "**Demonstrates:** post-call analysis for a WARM lead.\n\nTranscript: unclear budget, influencer not decision-maker (CTO needed), pain point exists, timing 3-4 months. LLM should score 4-6 and set intent='warm'.\n\nExpected side-effects:\n- `leads` updated: intent='warm', next_action='nurture'.\n- `nurture_queue` row inserted (step=1, scheduled_at = tomorrow working-hour start).\n\n**Expected:** HTTP 200 `{ status: 'ok', intent: 'warm', next_action: 'nurture' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('WARM lead routed to nurture', () => {",
+              "    pm.expect(body.status).to.equal('ok');",
+              "    pm.expect(body.intent).to.equal('warm');",
+              "    pm.expect(body.next_action).to.equal('nurture');",
+              "    pm.expect(body.nurture_step).to.equal(1);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Post-call idempotency replay",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"call_id\": \"retell_call_HOT_TEST_001\",\n  \"transcript\": \"... retell retried the webhook ...\",\n  \"cost\": 0.062\n}"
+        },
+        "url": { "raw": "{{base_url}}{{retell_path}}", "host": ["{{base_url}}{{retell_path}}"] },
+        "description": "**Demonstrates:** post-call idempotency.\n\nReplays request 4 with the same `call_id`. `processed_calls` has a PRIMARY KEY on `retell_call_id`. The `INSERT ... ON CONFLICT DO NOTHING` returns 0 rows; `IF: Call New?` routes to `Respond 200 (dup)`. No second LLM call, no second Calendar/Airtable record.\n\n**Expected:** HTTP 200 `{ status: 'already_processed' }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('Status 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('Already processed', () => {",
+              "    pm.expect(body.status).to.equal('already_processed');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url",    "value": "https://your-n8n.example.com", "type": "string" },
+    { "key": "lead_path",   "value": "/webhook/new-lead",             "type": "string" },
+    { "key": "retell_path", "value": "/webhook/retell-post-call",     "type": "string" },
+    { "key": "lead_id",     "value": "",                              "type": "string" }
+  ]
+}
